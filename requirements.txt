@@ -1,0 +1,8 @@
+solana>=0.36.0
+solders>=0.26.0
+anchorpy>=0.21.0
+whirlpool-essentials>=0.1.0
+python-telegram-bot==20.7
+APScheduler==3.10.4
+python-dotenv==1.0.0
+base58==2.1.1

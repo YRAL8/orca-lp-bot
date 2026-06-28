@@ -1,0 +1,25 @@
+# Solana RPC
+HELIUS_RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY
+
+# Кошелёк бота (приватный ключ в формате base58)
+WALLET_PRIVATE_KEY=YOUR_PRIVATE_KEY_BASE58
+
+# Orca позиция
+WHIRLPOOL_ADDRESS=HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ
+POSITION_MINT=YOUR_POSITION_NFT_MINT
+
+# Telegram
+TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN
+TELEGRAM_CHAT_ID=YOUR_CHAT_ID
+
+# Настройки бота
+DRY_RUN=true
+DEMO_POSITION=true
+RANGE_WIDTH_PCT=8
+POLL_INTERVAL_SEC=300
+REBALANCE_DELAY_MIN=20
+HEARTBEAT_INTERVAL_HOURS=4
+MIN_SOL_BALANCE=0.05
+
+# Публичный RPC (fallback, если Helius не задан — только чтение)
+PUBLIC_RPC_URL=https://api.mainnet-beta.solana.com
