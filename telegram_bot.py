@@ -1,7 +1,7 @@
 import asyncio
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, ContextTypes
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DRY_RUN
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DRY_RUN, DEMO_DEPOSIT_USD, is_placeholder
 from solana_client import get_sol_balance
 
 
@@ -11,7 +11,12 @@ current_position = None
 
 async def send_message(text: str) -> None:
     """Отправляет сообщение в Telegram."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if (
+        not TELEGRAM_BOT_TOKEN
+        or not TELEGRAM_CHAT_ID
+        or is_placeholder(TELEGRAM_BOT_TOKEN)
+        or is_placeholder(TELEGRAM_CHAT_ID)
+    ):
         print(f"📱 TELEGRAM (заглушка): {text}")
         return
     
@@ -95,6 +100,18 @@ async def notify_low_sol_balance(balance: float) -> None:
     )
 
 
+def format_position_balance(position) -> str:
+    """Текстовый блок: состав позиции SOL/USDC в USD."""
+    demo_note = f"\n<i>(демо ~${DEMO_DEPOSIT_USD:.0f}, задай POSITION_MINT)</i>" if getattr(position, "is_demo", False) else ""
+    return (
+        f"💰 <b>Позиция: ${position.total_value_usd:.2f}</b>{demo_note}\n"
+        f"   SOL:  {position.amount_sol:.4f}  (${position.value_sol_usd:.2f})\n"
+        f"   USDC: {position.amount_usdc:.2f}  (${position.value_usdc_usd:.2f})\n"
+        f"💵 Fees: {position.fees_sol:.4f} SOL + ${position.fees_usdc:.2f} USDC "
+        f"(≈${position.fees_total_usd:.2f})"
+    )
+
+
 async def send_heartbeat(position) -> None:
     """Heartbeat сообщение каждые 4 часа."""
     sol_balance = await get_sol_balance()
@@ -109,26 +126,31 @@ async def send_heartbeat(position) -> None:
 
     await send_message(
         f"💓 <b>Бот работает [{mode}]{demo}</b>\n"
-        f"Цена SOL: ${position.current_price:.2f}\n"
-        f"Диапазон: ${position.lower_price:.2f} — ${position.upper_price:.2f}\n"
-        f"Статус: {status}\n"
-        f"Fees: {position.fees_sol:.4f} SOL + {position.fees_usdc:.2f} USDC\n"
+        f"{format_position_balance(position)}\n"
+        f"📈 Цена SOL: ${position.current_price:.2f}\n"
+        f"   Диапазон: ${position.lower_price:.2f} — ${position.upper_price:.2f}\n"
+        f"   Статус: {status}\n"
         f"{balance_line}"
     )
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик команды /status — отвечает по запросу."""
+    """Обработчик /status — свежие данные с chain."""
     global current_position
-    
-    if current_position is None:
-        await update.message.reply_text("⏳ Позиция ещё не загружена, подожди...")
+
+    from orca import get_position
+
+    position = await get_position()
+    if position is None:
+        await update.message.reply_text("⏳ Не удалось загрузить позицию")
         return
-    
+
+    current_position = position
+
     sol_balance = await get_sol_balance()
-    status = "✅ в диапазоне" if current_position.in_range else "❌ вне диапазона"
+    status = "✅ в диапазоне" if position.in_range else "❌ вне диапазона"
     mode = "DRY RUN" if DRY_RUN else "БОЕВОЙ"
-    demo = " [демо-позиция]" if getattr(current_position, "is_demo", False) else ""
+    demo = " [демо]" if getattr(position, "is_demo", False) else ""
     balance_line = (
         f"Баланс SOL: {sol_balance:.4f}"
         if sol_balance is not None
@@ -136,12 +158,11 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
     await update.message.reply_text(
-        f"📊 <b>Статус позиции [{mode}]{demo}</b>\n"
-        f"Пара: SOL/USDC\n"
-        f"Текущая цена: ${current_position.current_price:.2f}\n"
-        f"Диапазон: ${current_position.lower_price:.2f} — ${current_position.upper_price:.2f}\n"
-        f"Статус: {status}\n"
-        f"Fees накоплено: {current_position.fees_sol:.4f} SOL + {current_position.fees_usdc:.2f} USDC\n"
+        f"📊 <b>Статус [{mode}]{demo}</b>\n"
+        f"{format_position_balance(position)}\n"
+        f"📈 Цена SOL: ${position.current_price:.2f}\n"
+        f"   Диапазон: ${position.lower_price:.2f} — ${position.upper_price:.2f}\n"
+        f"   Статус: {status}\n"
         f"{balance_line}",
         parse_mode="HTML"
     )
