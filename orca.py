@@ -16,6 +16,12 @@ from solana.rpc.async_api import AsyncClient
 from orca_whirlpool.constants import ORCA_WHIRLPOOL_PROGRAM_ID
 from orca_whirlpool.context import WhirlpoolContext
 from orca_whirlpool.internal.types.enums import PositionStatus
+from orca_whirlpool.quote import (
+    QuoteBuilder,
+    DecreaseLiquidityQuoteParams,
+    IncreaseLiquidityQuoteParams,
+)
+from orca_whirlpool.types import Percentage
 from orca_whirlpool.utils import DecimalUtil, PDAUtil, PositionUtil, PriceMath
 
 from config import (
@@ -24,6 +30,7 @@ from config import (
     RANGE_WIDTH_PCT,
     DRY_RUN,
     DEMO_POSITION,
+    DEMO_DEPOSIT_USD,
     is_placeholder,
     get_rpc_url,
 )
@@ -31,9 +38,9 @@ from solana_client import get_client
 
 log = logging.getLogger(__name__)
 
-# Адреса SOL и USDC — для подписи fees в логах
 SOL_MINT = "So11111111111111111111111111111111111111112"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+ZERO_SLIPPAGE = Percentage.from_fraction(0, 100)
 
 
 @dataclass
@@ -48,10 +55,16 @@ class Position:
     fees_usdc: float
     in_range: bool
     is_demo: bool = False
+    # Состав позиции в токенах и USD
+    amount_sol: float = 0.0
+    amount_usdc: float = 0.0
+    value_sol_usd: float = 0.0
+    value_usdc_usd: float = 0.0
+    total_value_usd: float = 0.0
+    fees_total_usd: float = 0.0
 
 
 async def _get_context(client: AsyncClient) -> WhirlpoolContext:
-    """WhirlpoolContext без реального кошелька — только чтение аккаунтов."""
     return WhirlpoolContext(ORCA_WHIRLPOOL_PROGRAM_ID, client, Keypair())
 
 
@@ -62,10 +75,6 @@ async def _load_whirlpool(ctx: WhirlpoolContext):
 
 
 async def _pool_price_and_decimals(ctx: WhirlpoolContext, whirlpool) -> tuple[float, int, int, str, str]:
-    """
-    Возвращает (цена token_b за token_a, decimals_a, decimals_b, symbol_a, symbol_b).
-    Для SOL/USDC: цена ≈ USDC за 1 SOL.
-    """
     mint_a = await ctx.fetcher.get_token_mint(whirlpool.token_mint_a)
     mint_b = await ctx.fetcher.get_token_mint(whirlpool.token_mint_b)
 
@@ -96,7 +105,6 @@ def _split_fees(
     decimals_a: int,
     decimals_b: int,
 ) -> tuple[float, float]:
-    """Приводит fee_owed_a/b к (SOL, USDC) независимо от порядка токенов в пуле."""
     fees_sol = 0.0
     fees_usdc = 0.0
 
@@ -113,8 +121,159 @@ def _split_fees(
     return fees_sol, fees_usdc
 
 
+def _amounts_to_sol_usdc(
+    whirlpool,
+    amount_a: int,
+    amount_b: int,
+    decimals_a: int,
+    decimals_b: int,
+    current_price: float,
+) -> tuple[float, float, float, float, float]:
+    """Конвертирует token_a/b в SOL, USDC и USD-стоимость."""
+    amt_a = amount_a / 10**decimals_a
+    amt_b = amount_b / 10**decimals_b
+
+    if str(whirlpool.token_mint_a) == SOL_MINT:
+        amount_sol, amount_usdc = amt_a, amt_b
+    elif str(whirlpool.token_mint_b) == SOL_MINT:
+        amount_sol, amount_usdc = amt_b, amt_a
+    else:
+        # Нестандартная пара — token_a в USD по текущей цене
+        amount_sol, amount_usdc = amt_a, amt_b
+
+    value_sol_usd = amount_sol * current_price
+    value_usdc_usd = amount_usdc
+    total_value_usd = value_sol_usd + value_usdc_usd
+    return amount_sol, amount_usdc, value_sol_usd, value_usdc_usd, total_value_usd
+
+
+def _amounts_from_liquidity(
+    whirlpool,
+    tick_lower_index: int,
+    tick_upper_index: int,
+    liquidity: int,
+    decimals_a: int,
+    decimals_b: int,
+    current_price: float,
+) -> tuple[float, float, float, float, float]:
+    """Считает SOL/USDC в позиции по liquidity и диапазону тиков."""
+    if liquidity <= 0:
+        return 0.0, 0.0, 0.0, 0.0, 0.0
+
+    quote = QuoteBuilder.decrease_liquidity_by_liquidity(
+        DecreaseLiquidityQuoteParams(
+            liquidity=liquidity,
+            tick_current_index=whirlpool.tick_current_index,
+            sqrt_price=whirlpool.sqrt_price,
+            tick_lower_index=tick_lower_index,
+            tick_upper_index=tick_upper_index,
+            slippage_tolerance=ZERO_SLIPPAGE,
+        )
+    )
+    return _amounts_to_sol_usdc(
+        whirlpool,
+        quote.token_est_a,
+        quote.token_est_b,
+        decimals_a,
+        decimals_b,
+        current_price,
+    )
+
+
+def _demo_amounts_from_deposit(
+    whirlpool,
+    tick_lower_index: int,
+    tick_upper_index: int,
+    decimals_a: int,
+    decimals_b: int,
+    current_price: float,
+    deposit_usd: float,
+) -> tuple[float, float, float, float, float]:
+    """
+    Оценка состава демо-позиции: симулируем депозит deposit_usd через USDC.
+    Точность ≈ Orca SDK; для реальных денег нужен POSITION_MINT.
+    """
+    if deposit_usd <= 0:
+        return 0.0, 0.0, 0.0, 0.0, 0.0
+
+    input_mint = (
+        whirlpool.token_mint_b
+        if str(whirlpool.token_mint_b) == USDC_MINT
+        else whirlpool.token_mint_a
+    )
+    usdc_decimals = decimals_b if str(whirlpool.token_mint_b) == USDC_MINT else decimals_a
+    input_amount = int(deposit_usd / 2 * 10**usdc_decimals)
+
+    quote = QuoteBuilder.increase_liquidity_by_input_token(
+        IncreaseLiquidityQuoteParams(
+            input_token_amount=input_amount,
+            input_token_mint=input_mint,
+            token_mint_a=whirlpool.token_mint_a,
+            token_mint_b=whirlpool.token_mint_b,
+            tick_current_index=whirlpool.tick_current_index,
+            sqrt_price=whirlpool.sqrt_price,
+            tick_lower_index=tick_lower_index,
+            tick_upper_index=tick_upper_index,
+            slippage_tolerance=ZERO_SLIPPAGE,
+        )
+    )
+    return _amounts_to_sol_usdc(
+        whirlpool,
+        quote.token_est_a,
+        quote.token_est_b,
+        decimals_a,
+        decimals_b,
+        current_price,
+    )
+
+
+def _price_to_tick(price: float, decimals_a: int, decimals_b: int, tick_spacing: int) -> int:
+    return PriceMath.price_to_initializable_tick_index(
+        Decimal(str(price)),
+        decimals_a,
+        decimals_b,
+        tick_spacing,
+    )
+
+
+def _fill_position_amounts(
+    position: Position,
+    whirlpool,
+    tick_lower_index: int,
+    tick_upper_index: int,
+    decimals_a: int,
+    decimals_b: int,
+) -> Position:
+    """Дополняет Position полями SOL/USDC и USD."""
+    if position.is_demo:
+        amounts = _demo_amounts_from_deposit(
+            whirlpool,
+            tick_lower_index,
+            tick_upper_index,
+            decimals_a,
+            decimals_b,
+            position.current_price,
+            DEMO_DEPOSIT_USD,
+        )
+    else:
+        amounts = _amounts_from_liquidity(
+            whirlpool,
+            tick_lower_index,
+            tick_upper_index,
+            position.liquidity,
+            decimals_a,
+            decimals_b,
+            position.current_price,
+        )
+
+    position.amount_sol, position.amount_usdc, position.value_sol_usd, position.value_usdc_usd, position.total_value_usd = amounts
+    position.fees_total_usd = (
+        position.fees_sol * position.current_price + position.fees_usdc
+    )
+    return position
+
+
 def _demo_position(current_price: float) -> Position:
-    """Демо-диапазон вокруг реальной цены — для dry-run без POSITION_MINT."""
     lower = current_price * (1 - RANGE_WIDTH_PCT / 100)
     upper = current_price * (1 + RANGE_WIDTH_PCT / 100)
     return Position(
@@ -131,27 +290,14 @@ def _demo_position(current_price: float) -> Position:
 
 
 async def get_current_price() -> float:
-    """Текущая цена пула с mainnet (on-chain sqrtPrice)."""
     async with get_client() as client:
         ctx = await _get_context(client)
         whirlpool = await _load_whirlpool(ctx)
-        price, _, _, sym_a, sym_b = await _pool_price_and_decimals(ctx, whirlpool)
-        log.debug(
-            "Цена пула %s/%s: %s (tick=%s, rpc=%s)",
-            sym_a,
-            sym_b,
-            price,
-            whirlpool.tick_current_index,
-            get_rpc_url()[:40],
-        )
+        price, _, _, _, _ = await _pool_price_and_decimals(ctx, whirlpool)
         return price
 
 
 async def get_position() -> Optional[Position]:
-    """
-    Читает LP-позицию с mainnet по POSITION_MINT (NFT mint).
-    Если mint не задан и DEMO_POSITION=true — строит демо-диапазон вокруг реальной цены.
-    """
     async with get_client() as client:
         ctx = await _get_context(client)
         whirlpool = await _load_whirlpool(ctx)
@@ -160,10 +306,15 @@ async def get_position() -> Optional[Position]:
         if is_placeholder(POSITION_MINT):
             if DRY_RUN and DEMO_POSITION:
                 pos = _demo_position(current_price)
+                tick_lower = _price_to_tick(pos.lower_price, dec_a, dec_b, whirlpool.tick_spacing)
+                tick_upper = _price_to_tick(pos.upper_price, dec_a, dec_b, whirlpool.tick_spacing)
+                pos = _fill_position_amounts(pos, whirlpool, tick_lower, tick_upper, dec_a, dec_b)
                 log.info(
-                    "DEMO позиция (задай POSITION_MINT для реальной): "
-                    "$%.2f, диапазон $%.2f—$%.2f",
-                    current_price,
+                    "DEMO позиция ~$%.0f | SOL $%.2f + USDC $%.2f = $%.2f | диапазон $%.2f—$%.2f",
+                    DEMO_DEPOSIT_USD,
+                    pos.value_sol_usd,
+                    pos.value_usdc_usd,
+                    pos.total_value_usd,
                     pos.lower_price,
                     pos.upper_price,
                 )
@@ -197,7 +348,6 @@ async def get_position() -> Optional[Position]:
             on_chain.tick_lower_index,
             on_chain.tick_upper_index,
         )
-        in_range = status == PositionStatus.PriceIsInRange
         fees_sol, fees_usdc = _split_fees(
             whirlpool,
             on_chain.fee_owed_a,
@@ -214,29 +364,38 @@ async def get_position() -> Optional[Position]:
             liquidity=on_chain.liquidity,
             fees_sol=fees_sol,
             fees_usdc=fees_usdc,
-            in_range=in_range,
+            in_range=status == PositionStatus.PriceIsInRange,
             is_demo=False,
+        )
+        position = _fill_position_amounts(
+            position,
+            whirlpool,
+            on_chain.tick_lower_index,
+            on_chain.tick_upper_index,
+            dec_a,
+            dec_b,
         )
 
         log.info(
-            "Позиция %s/%s | цена $%.4f | диапазон $%.4f—$%.4f | %s",
+            "Позиция %s/%s | $%.2f (SOL $%.2f + USDC $%.2f) | цена $%.2f | %s",
             sym_a,
             sym_b,
+            position.total_value_usd,
+            position.value_sol_usd,
+            position.value_usdc_usd,
             current_price,
-            lower_price,
-            upper_price,
-            "в диапазоне" if in_range else "ВНЕ диапазона",
+            "в диапазоне" if position.in_range else "ВНЕ диапазона",
         )
         return position
 
 
 async def collect_fees(position: Position) -> tuple[float, float]:
-    """Сбор fees — в dry-run только лог."""
     if DRY_RUN:
         log.info(
-            "DRY RUN: collect_fees — %.6f SOL + %.4f USDC",
+            "DRY RUN: collect_fees — %.6f SOL + %.4f USDC (≈$%.2f)",
             position.fees_sol,
             position.fees_usdc,
+            position.fees_total_usd,
         )
         return position.fees_sol, position.fees_usdc
 
@@ -244,17 +403,15 @@ async def collect_fees(position: Position) -> tuple[float, float]:
 
 
 async def close_position(position: Position) -> bool:
-    """Закрытие позиции — в dry-run только лог."""
     if DRY_RUN:
         label = position.mint[:8] if len(position.mint) > 8 else position.mint
-        log.info("DRY RUN: close_position — %s", label)
+        log.info("DRY RUN: close_position — %s ($%.2f)", label, position.total_value_usd)
         return True
 
     raise NotImplementedError("Реальное закрытие не реализовано — включи DRY_RUN=true")
 
 
 async def open_position(current_price: float) -> Optional[Position]:
-    """Открытие новой позиции ±RANGE_WIDTH_PCT — в dry-run симуляция."""
     lower = current_price * (1 - RANGE_WIDTH_PCT / 100)
     upper = current_price * (1 + RANGE_WIDTH_PCT / 100)
 
@@ -281,7 +438,6 @@ async def open_position(current_price: float) -> Optional[Position]:
 
 
 async def rebalance(position: Position) -> Optional[Position]:
-    """Полный цикл ребаланса: fees → close → open (симуляция в dry-run)."""
     log.info("Начинаем ребаланс%s...", " [DRY RUN]" if DRY_RUN else "")
 
     await collect_fees(position)

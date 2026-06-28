@@ -27,6 +27,8 @@ MIN_SOL_BALANCE = float(os.getenv("MIN_SOL_BALANCE", "0.05"))
 
 # Если POSITION_MINT не задан — в dry-run строим демо-диапазон вокруг реальной цены
 DEMO_POSITION = os.getenv("DEMO_POSITION", "true").lower() == "true"
+# Сумма для демо-отчёта (USD), когда нет реальной позиции
+DEMO_DEPOSIT_USD = float(os.getenv("DEMO_DEPOSIT_USD", "1000"))
 
 _PLACEHOLDER_MARKERS = (
     "YOUR_",

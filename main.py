@@ -60,6 +60,8 @@ async def monitor_position() -> None:
 
     log.info(
         f"Цена: ${position.current_price:.2f} | "
+        f"Позиция: ${position.total_value_usd:.2f} "
+        f"(SOL ${position.value_sol_usd:.2f} + USDC ${position.value_usdc_usd:.2f}) | "
         f"Диапазон: ${position.lower_price:.2f}—${position.upper_price:.2f} | "
         f"{'✅ в диапазоне' if position.in_range else '❌ вне диапазона'}"
     )
