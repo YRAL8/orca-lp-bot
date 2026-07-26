@@ -216,7 +216,7 @@ async def setrange_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     global current_position
 
     import config
-    from orca import get_position
+    from orca import get_position, reset_demo_range
 
     try:
         if not context.args:
@@ -252,6 +252,7 @@ async def setrange_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
 
         config.RANGE_WIDTH_PCT = pct
+        reset_demo_range()
 
         position = await get_position()
         if position is None:

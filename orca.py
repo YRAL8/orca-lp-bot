@@ -38,6 +38,9 @@ from solana_client import get_client
 
 log = logging.getLogger(__name__)
 
+# Зафиксированный демо-диапазон: создаётся один раз, пока не вызовут reset_demo_range().
+_demo_range: dict | None = None  # lower_price, upper_price, tick_lower, tick_upper
+
 SOL_MINT = "So11111111111111111111111111111111111111112"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 ZERO_SLIPPAGE = Percentage.from_fraction(0, 100)
@@ -273,18 +276,22 @@ def _fill_position_amounts(
     return position
 
 
-def _demo_position(current_price: float) -> Position:
-    lower = current_price * (1 - config.RANGE_WIDTH_PCT / 100)
-    upper = current_price * (1 + config.RANGE_WIDTH_PCT / 100)
+def reset_demo_range() -> None:
+    """Сбросить кэш демо-диапазона — следующий get_position() соберёт его заново."""
+    global _demo_range
+    _demo_range = None
+
+
+def _demo_position(current_price: float, lower_price: float, upper_price: float) -> Position:
     return Position(
         mint="DEMO",
-        lower_price=lower,
-        upper_price=upper,
+        lower_price=lower_price,
+        upper_price=upper_price,
         current_price=current_price,
         liquidity=0,
         fees_sol=0.0,
         fees_usdc=0.0,
-        in_range=True,
+        in_range=lower_price <= current_price <= upper_price,
         is_demo=True,
     )
 
@@ -305,23 +312,46 @@ async def get_position() -> Optional[Position]:
 
         if is_placeholder(POSITION_MINT):
             if DRY_RUN and DEMO_POSITION:
-                pos = _demo_position(current_price)
-                tick_lower = _price_to_tick(pos.lower_price, dec_a, dec_b, whirlpool.tick_spacing)
-                tick_upper = _price_to_tick(pos.upper_price, dec_a, dec_b, whirlpool.tick_spacing)
-                # Align displayed range with ticks used for amounts (rounding can be asymmetric).
-                pos.lower_price = float(
-                    DecimalUtil.to_fixed(
-                        PriceMath.tick_index_to_price(tick_lower, dec_a, dec_b),
-                        dec_b,
+                global _demo_range
+                if _demo_range is None:
+                    raw_lower = current_price * (1 - config.RANGE_WIDTH_PCT / 100)
+                    raw_upper = current_price * (1 + config.RANGE_WIDTH_PCT / 100)
+                    tick_lower = _price_to_tick(
+                        raw_lower, dec_a, dec_b, whirlpool.tick_spacing
                     )
-                )
-                pos.upper_price = float(
-                    DecimalUtil.to_fixed(
-                        PriceMath.tick_index_to_price(tick_upper, dec_a, dec_b),
-                        dec_b,
+                    tick_upper = _price_to_tick(
+                        raw_upper, dec_a, dec_b, whirlpool.tick_spacing
                     )
+                    # Align displayed range with ticks used for amounts (rounding can be asymmetric).
+                    _demo_range = {
+                        "lower_price": float(
+                            DecimalUtil.to_fixed(
+                                PriceMath.tick_index_to_price(tick_lower, dec_a, dec_b),
+                                dec_b,
+                            )
+                        ),
+                        "upper_price": float(
+                            DecimalUtil.to_fixed(
+                                PriceMath.tick_index_to_price(tick_upper, dec_a, dec_b),
+                                dec_b,
+                            )
+                        ),
+                        "tick_lower": tick_lower,
+                        "tick_upper": tick_upper,
+                    }
+                pos = _demo_position(
+                    current_price,
+                    _demo_range["lower_price"],
+                    _demo_range["upper_price"],
                 )
-                pos = _fill_position_amounts(pos, whirlpool, tick_lower, tick_upper, dec_a, dec_b)
+                pos = _fill_position_amounts(
+                    pos,
+                    whirlpool,
+                    _demo_range["tick_lower"],
+                    _demo_range["tick_upper"],
+                    dec_a,
+                    dec_b,
+                )
                 log.info(
                     "DEMO позиция ~$%.0f | SOL $%.2f + USDC $%.2f = $%.2f | диапазон $%.2f—$%.2f",
                     DEMO_DEPOSIT_USD,
