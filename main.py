@@ -105,7 +105,7 @@ async def monitor_position() -> None:
         # Цена внутри диапазона — всё хорошо
         if position.in_range:
             # Если до этого копился «стухший» алерт — сообщаем, что цена вернулась
-            if out_of_range_since is not None and stale_alert_sent:
+            if out_of_range_since is not None:
                 await tg.notify_price_returned(position)
                 log.info("Цена вернулась в диапазон")
             out_of_range_since = None
