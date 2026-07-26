@@ -27,7 +27,7 @@ price_history: deque[float] = deque(maxlen=12)
 _bot: Bot | None = None
 
 # Команды, доступные только владельцу (TELEGRAM_CHAT_ID).
-_OWNER_COMMANDS = ("status", "setrange")
+_OWNER_COMMANDS = ("status", "setrange", "rebalance")
 
 
 def _owner_chat_id() -> int | None:
@@ -449,6 +449,51 @@ async def setrange_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
 
 
+async def rebalance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Обработчик /rebalance — вручную запускает ребаланс текущей позиции прямо сейчас,
+    независимо от AUTO_REBALANCE (та настройка гейтит только автоматический путь из
+    monitor_position(), ручной вызов через Telegram — осознанное действие владельца).
+    """
+    global current_position
+
+    # main._rebalance_lock — тот же лок, что и у автоматического ребаланса в
+    # monitor_position(). Импорт внутри функции (не на уровне модуля) — main.py уже
+    # импортирует telegram_bot как tg, импорт в обратную сторону на уровне модуля
+    # был бы циклическим.
+    import main
+    from orca import get_position, rebalance
+
+    if main._rebalance_lock.locked():
+        await _reply(update, context, "⏳ Ребаланс уже выполняется — подожди.")
+        return
+
+    try:
+        position = await get_position()
+    except Exception as e:
+        await _reply(update, context, f"❌ Не удалось загрузить позицию: {e}")
+        return
+
+    if position is None:
+        await _reply(update, context, "❌ Нет открытой позиции для ребаланса.")
+        return
+
+    await _reply(update, context, "🔄 Начинаю ручной ребаланс...")
+
+    async with main._rebalance_lock:
+        try:
+            await notify_rebalance_start(position)
+            new_position = await rebalance(position)
+            if new_position:
+                current_position = new_position
+                await notify_rebalance_complete(position, new_position)
+            else:
+                await notify_rebalance_error("Не удалось выполнить ребаланс")
+        except Exception as e:
+            log.exception("Ошибка при ручном /rebalance: %s", e)
+            await notify_rebalance_error(str(e))
+
+
 def build_telegram_app() -> Application:
     """Создаёт и настраивает Telegram приложение с командами."""
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -464,6 +509,7 @@ def build_telegram_app() -> Application:
     owner_chat = filters.Chat(chat_id=owner_id)
     app.add_handler(CommandHandler("status", status_command, filters=owner_chat))
     app.add_handler(CommandHandler("setrange", setrange_command, filters=owner_chat))
+    app.add_handler(CommandHandler("rebalance", rebalance_command, filters=owner_chat))
     # Чужие чаты: только warning в лог, без ответа (не светим, что бот живой).
     app.add_handler(
         CommandHandler(
