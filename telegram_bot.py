@@ -156,6 +156,25 @@ async def send_heartbeat(position) -> None:
     )
 
 
+async def _reply(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    *,
+    parse_mode: str | None = None,
+) -> None:
+    """Надёжная отправка ответа: effective_message, иначе send_message в TELEGRAM_CHAT_ID."""
+    message = update.effective_message
+    if message is not None:
+        await message.reply_text(text, parse_mode=parse_mode)
+        return
+    await context.bot.send_message(
+        chat_id=TELEGRAM_CHAT_ID,
+        text=text,
+        parse_mode=parse_mode,
+    )
+
+
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик /status — свежие данные с chain."""
     global current_position
@@ -164,7 +183,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     position = await get_position()
     if position is None:
-        await update.message.reply_text("⏳ Не удалось загрузить позицию")
+        await _reply(update, context, "⏳ Не удалось загрузить позицию")
         return
 
     current_position = position
@@ -179,14 +198,16 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         else "Кошелёк не настроен (read-only)"
     )
 
-    await update.message.reply_text(
+    await _reply(
+        update,
+        context,
         f"📊 <b>Статус [{mode}]{demo}</b>\n"
         f"{format_position_balance(position)}\n"
         f"📈 Цена SOL: ${position.current_price:.2f}\n"
         f"{format_range(position)}\n"
         f"   Статус: {status}\n"
         f"{balance_line}",
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
 
 
@@ -197,50 +218,70 @@ async def setrange_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     import config
     from orca import get_position
 
-    if not context.args:
-        await update.message.reply_text(
-            "Использование: /setrange &lt;процент&gt;\n"
-            "Пример: /setrange 5 или /setrange 3.5\n"
-            "Допустимо: от 0.1 до 50",
+    try:
+        if not context.args:
+            await _reply(
+                update,
+                context,
+                "Использование: /setrange &lt;процент&gt;\n"
+                "Пример: /setrange 5 или /setrange 3.5\n"
+                "Допустимо: от 1 до 50",
+                parse_mode="HTML",
+            )
+            return
+
+        try:
+            pct = float(context.args[0])
+        except ValueError:
+            await _reply(
+                update,
+                context,
+                "❌ Нужно число, например: /setrange 5 или /setrange 3.5",
+            )
+            return
+
+        if not (1.0 <= pct <= 50):
+            await _reply(
+                update,
+                context,
+                "❌ Процент должен быть от 1 до 50 (включительно).\n"
+                "Диапазоны уже 1% нереалистичны для реальной LP-позиции "
+                "и ломают демо-расчёт стоимости (не 50/50 при очень узком "
+                "диапазоне — свойство математики концентрированной ликвидности).",
+            )
+            return
+
+        config.RANGE_WIDTH_PCT = pct
+
+        position = await get_position()
+        if position is None:
+            await _reply(
+                update,
+                context,
+                f"✅ RANGE_WIDTH_PCT = ±{pct}%\n"
+                "⏳ Не удалось загрузить позицию для показа нового диапазона.\n"
+                "Изменение действует до перезапуска бота — в .env остаётся прежнее значение по умолчанию.",
+            )
+            return
+
+        current_position = position
+
+        await _reply(
+            update,
+            context,
+            f"✅ <b>Диапазон обновлён: ±{pct}%</b>\n"
+            f"📈 Цена SOL: ${position.current_price:.2f}\n"
+            f"   Нижняя: ${position.lower_price:.2f}\n"
+            f"   Верхняя: ${position.upper_price:.2f}\n"
+            f"Изменение действует до перезапуска бота — в .env остаётся прежнее значение по умолчанию.",
             parse_mode="HTML",
         )
-        return
-
-    try:
-        pct = float(context.args[0])
-    except ValueError:
-        await update.message.reply_text(
-            "❌ Нужно число, например: /setrange 5 или /setrange 3.5"
+    except Exception as e:
+        await _reply(
+            update,
+            context,
+            f"❌ Ошибка /setrange: {e}",
         )
-        return
-
-    if not (0.1 <= pct <= 50):
-        await update.message.reply_text(
-            "❌ Процент должен быть от 0.1 до 50 (включительно)"
-        )
-        return
-
-    config.RANGE_WIDTH_PCT = pct
-
-    position = await get_position()
-    if position is None:
-        await update.message.reply_text(
-            f"✅ RANGE_WIDTH_PCT = ±{pct}%\n"
-            "⏳ Не удалось загрузить позицию для показа нового диапазона.\n"
-            "Изменение действует до перезапуска бота — в .env остаётся прежнее значение по умолчанию."
-        )
-        return
-
-    current_position = position
-
-    await update.message.reply_text(
-        f"✅ <b>Диапазон обновлён: ±{pct}%</b>\n"
-        f"📈 Цена SOL: ${position.current_price:.2f}\n"
-        f"   Нижняя: ${position.lower_price:.2f}\n"
-        f"   Верхняя: ${position.upper_price:.2f}\n"
-        f"Изменение действует до перезапуска бота — в .env остаётся прежнее значение по умолчанию.",
-        parse_mode="HTML",
-    )
 
 
 def build_telegram_app() -> Application:
