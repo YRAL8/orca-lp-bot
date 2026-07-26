@@ -9,6 +9,7 @@ from config import (
     DRY_RUN,
     AUTO_REBALANCE,
     DEMO_DEPOSIT_USD,
+    POLL_INTERVAL_SEC,
     REBALANCE_DELAY_MIN,
     is_placeholder,
 )
@@ -19,10 +20,8 @@ log = logging.getLogger(__name__)
 # Глобальная ссылка на текущую позицию (обновляется из main.py)
 current_position = None
 
-# История цен для sparkline (обновляется из main.py / monitor_position)
+# История цен для тренда (обновляется из main.py / monitor_position)
 price_history: deque[float] = deque(maxlen=12)
-
-_SPARK_CHARS = "▁▂▃▄▅▆▇█"
 
 # Ленивый singleton Bot — создаётся при первом реальном send_message().
 _bot: Bot | None = None
@@ -89,7 +88,7 @@ async def send_message(text: str) -> None:
 
 async def notify_startup() -> None:
     """Уведомление о запуске бота — явно показывает DRY_RUN / AUTO_REBALANCE."""
-    from config import POLL_INTERVAL_SEC, RANGE_WIDTH_PCT, POSITION_MINT
+    from config import RANGE_WIDTH_PCT, POSITION_MINT
 
     if DRY_RUN:
         dry = "DRY RUN"
@@ -219,27 +218,6 @@ def format_position_balance(position) -> str:
     )
 
 
-def _format_bound_pct(pct: float, *, in_range_sign: str) -> str:
-    """Процент относительно границы: abs + явный знак, без '+-' / '--'.
-
-    pct >= 0 — цена по обычную сторону границы (in_range_sign).
-    pct < 0  — цена уже пересекла границу (перелёт) → минус.
-    """
-    if pct >= 0:
-        return f"{in_range_sign}{pct:.1f}%"
-    return f"−{abs(pct):.1f}%"
-
-
-def format_range(position) -> str:
-    """Диапазон с процентным отклонением границ от текущей цены."""
-    pct_lower = (position.current_price - position.lower_price) / position.current_price * 100
-    pct_upper = (position.upper_price - position.current_price) / position.current_price * 100
-    return (
-        f"   Диапазон: ${position.lower_price:.2f} ({_format_bound_pct(pct_lower, in_range_sign='−')}) "
-        f"— ${position.upper_price:.2f} ({_format_bound_pct(pct_upper, in_range_sign='+')})"
-    )
-
-
 def format_range_bar(position) -> str:
     """Прогресс-бар положения цены в диапазоне (16 символов █/░)."""
     span = position.upper_price - position.lower_price
@@ -268,31 +246,38 @@ def format_range_bar(position) -> str:
     )
 
 
-def format_sparkline() -> str:
-    """Мини-график последних цен из price_history; пустая строка если < 2 точек."""
+def _format_trend_period(seconds: int) -> str:
+    """Человекочитаемый период тренда по накопленной истории."""
+    minutes = max(1, seconds // 60) if seconds > 0 else 0
+    if minutes < 60:
+        return f"{minutes} мин"
+    hours = minutes // 60
+    rem = minutes % 60
+    if rem == 0:
+        return f"{hours}ч"
+    return f"{hours}ч {rem}мин"
+
+
+def format_price_trend(position) -> str:
+    """Стрелка тренда и % изменения от самой старой точки price_history.
+
+    Пустая строка, пока накопилось меньше 2 точек.
+    """
     if len(price_history) < 2:
         return ""
-    prices = list(price_history)
-    lo = min(prices)
-    hi = max(prices)
-    if hi <= lo:
-        levels = [3] * len(prices)
+    oldest = price_history[0]
+    if oldest <= 0:
+        return ""
+    change_pct = (position.current_price - oldest) / oldest * 100
+    if change_pct > 0.5:
+        arrow = "↗"
+    elif change_pct < -0.5:
+        arrow = "↘"
     else:
-        levels = [int((p - lo) / (hi - lo) * 7) for p in prices]
-    spark = "".join(_SPARK_CHARS[level] for level in levels)
-    return f"<code>{spark}</code>"
-
-
-def _range_and_spark_section(position, *, include_format_range: bool) -> str:
-    """Секция диапазона + опциональный sparkline под баром."""
-    parts: list[str] = []
-    if include_format_range:
-        parts.append(format_range(position))
-    parts.append(format_range_bar(position))
-    spark = format_sparkline()
-    if spark:
-        parts.append(spark)
-    return "\n".join(parts)
+        arrow = "→"
+    period = _format_trend_period(len(price_history) * POLL_INTERVAL_SEC)
+    sign = "+" if change_pct >= 0 else ""
+    return f" ({arrow} {sign}{change_pct:.1f}% за {period})"
 
 
 async def send_heartbeat(position) -> None:
@@ -307,12 +292,11 @@ async def send_heartbeat(position) -> None:
         else "Кошелёк не настроен (read-only)"
     )
 
-    # Вариант A: бар вместо процентной строки format_range (см. discussion 2026-07-26)
     await send_message(
         f"💓 <b>Бот работает [{mode}]{demo}</b>\n"
         f"{format_position_balance(position)}\n"
-        f"📈 Цена SOL: ${position.current_price:.2f}\n"
-        f"{_range_and_spark_section(position, include_format_range=False)}\n"
+        f"📈 Цена SOL: ${position.current_price:.2f}{format_price_trend(position)}\n"
+        f"{format_range_bar(position)}\n"
         f"   Статус: {status}\n"
         f"{balance_line}"
     )
@@ -360,14 +344,13 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         else "Кошелёк не настроен (read-only)"
     )
 
-    # Вариант A: бар вместо процентной строки format_range (см. discussion 2026-07-26)
     await _reply(
         update,
         context,
         f"📊 <b>Статус [{mode}]{demo}</b>\n"
         f"{format_position_balance(position)}\n"
-        f"📈 Цена SOL: ${position.current_price:.2f}\n"
-        f"{_range_and_spark_section(position, include_format_range=False)}\n"
+        f"📈 Цена SOL: ${position.current_price:.2f}{format_price_trend(position)}\n"
+        f"{format_range_bar(position)}\n"
         f"   Статус: {status}\n"
         f"{balance_line}",
         parse_mode="HTML",
