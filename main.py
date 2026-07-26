@@ -1,11 +1,11 @@
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import telegram_bot as tg
 from orca import get_position, rebalance, get_current_price
-from solana_client import get_sol_balance, check_sol_balance
+from solana_client import get_sol_balance
 from config import (
     POLL_INTERVAL_SEC, REBALANCE_DELAY_MIN,
     HEARTBEAT_INTERVAL_HOURS, DRY_RUN, AUTO_REBALANCE, MIN_SOL_BALANCE,

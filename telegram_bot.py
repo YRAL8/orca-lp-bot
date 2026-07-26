@@ -10,6 +10,9 @@ log = logging.getLogger(__name__)
 # Глобальная ссылка на текущую позицию (обновляется из main.py)
 current_position = None
 
+# Ленивый singleton Bot — создаётся при первом реальном send_message().
+_bot: Bot | None = None
+
 # Команды, доступные только владельцу (TELEGRAM_CHAT_ID).
 _OWNER_COMMANDS = ("status", "setrange")
 
@@ -43,6 +46,14 @@ async def unauthorized_command(
     )
 
 
+def _get_bot() -> Bot:
+    """Возвращает общий Bot, создавая его при первом вызове."""
+    global _bot
+    if _bot is None:
+        _bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    return _bot
+
+
 async def send_message(text: str) -> None:
     """Отправляет сообщение в Telegram."""
     if (
@@ -53,8 +64,8 @@ async def send_message(text: str) -> None:
     ):
         print(f"📱 TELEGRAM (заглушка): {text}")
         return
-    
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+
+    bot = _get_bot()
     await bot.send_message(
         chat_id=TELEGRAM_CHAT_ID,
         text=text,
@@ -64,10 +75,14 @@ async def send_message(text: str) -> None:
 
 async def notify_startup() -> None:
     """Уведомление о запуске бота."""
-    from config import POLL_INTERVAL_SEC, RANGE_WIDTH_PCT, DEMO_POSITION
+    from config import POLL_INTERVAL_SEC, RANGE_WIDTH_PCT, POSITION_MINT
 
     mode = "🔸 DRY RUN (без транзакций)" if DRY_RUN else "🟢 БОЕВОЙ режим"
-    demo = "\n📎 Демо-позиция (задай POSITION_MINT)" if DEMO_POSITION else ""
+    demo = (
+        "\n📎 Демо-позиция (задай POSITION_MINT)"
+        if is_placeholder(POSITION_MINT)
+        else ""
+    )
     await send_message(
         f"🤖 <b>Бот запущен</b>\n"
         f"{mode}\n"
@@ -166,13 +181,24 @@ def format_position_balance(position) -> str:
     )
 
 
+def _format_bound_pct(pct: float, *, in_range_sign: str) -> str:
+    """Процент относительно границы: abs + явный знак, без '+-' / '--'.
+
+    pct >= 0 — цена по обычную сторону границы (in_range_sign).
+    pct < 0  — цена уже пересекла границу (перелёт) → минус.
+    """
+    if pct >= 0:
+        return f"{in_range_sign}{pct:.1f}%"
+    return f"−{abs(pct):.1f}%"
+
+
 def format_range(position) -> str:
     """Диапазон с процентным отклонением границ от текущей цены."""
     pct_lower = (position.current_price - position.lower_price) / position.current_price * 100
     pct_upper = (position.upper_price - position.current_price) / position.current_price * 100
     return (
-        f"   Диапазон: ${position.lower_price:.2f} (−{pct_lower:.1f}%) "
-        f"— ${position.upper_price:.2f} (+{pct_upper:.1f}%)"
+        f"   Диапазон: ${position.lower_price:.2f} ({_format_bound_pct(pct_lower, in_range_sign='−')}) "
+        f"— ${position.upper_price:.2f} ({_format_bound_pct(pct_upper, in_range_sign='+')})"
     )
 
 
