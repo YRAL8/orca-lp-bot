@@ -124,6 +124,16 @@ def format_position_balance(position) -> str:
     )
 
 
+def format_range(position) -> str:
+    """Диапазон с процентным отклонением границ от текущей цены."""
+    pct_lower = (position.current_price - position.lower_price) / position.current_price * 100
+    pct_upper = (position.upper_price - position.current_price) / position.current_price * 100
+    return (
+        f"   Диапазон: ${position.lower_price:.2f} (−{pct_lower:.1f}%) "
+        f"— ${position.upper_price:.2f} (+{pct_upper:.1f}%)"
+    )
+
+
 async def send_heartbeat(position) -> None:
     """Heartbeat сообщение каждые 4 часа."""
     sol_balance = await get_sol_balance()
@@ -140,7 +150,7 @@ async def send_heartbeat(position) -> None:
         f"💓 <b>Бот работает [{mode}]{demo}</b>\n"
         f"{format_position_balance(position)}\n"
         f"📈 Цена SOL: ${position.current_price:.2f}\n"
-        f"   Диапазон: ${position.lower_price:.2f} — ${position.upper_price:.2f}\n"
+        f"{format_range(position)}\n"
         f"   Статус: {status}\n"
         f"{balance_line}"
     )
@@ -173,7 +183,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"📊 <b>Статус [{mode}]{demo}</b>\n"
         f"{format_position_balance(position)}\n"
         f"📈 Цена SOL: ${position.current_price:.2f}\n"
-        f"   Диапазон: ${position.lower_price:.2f} — ${position.upper_price:.2f}\n"
+        f"{format_range(position)}\n"
         f"   Статус: {status}\n"
         f"{balance_line}",
         parse_mode="HTML"
