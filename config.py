@@ -33,6 +33,22 @@ MIN_SOL_BALANCE = float(os.getenv("MIN_SOL_BALANCE", "0.05"))
 DEMO_POSITION = os.getenv("DEMO_POSITION", "true").lower() == "true"
 # Сумма для демо-отчёта (USD), когда нет реальной позиции
 DEMO_DEPOSIT_USD = float(os.getenv("DEMO_DEPOSIT_USD", "1000"))
+# Реальный single-side депозит в USDC для открытия позиции
+OPEN_POSITION_USDC_AMOUNT = float(os.getenv("OPEN_POSITION_USDC_AMOUNT", "2.0"))
+# Priority fee (micro-lamports за compute unit) для реальных транзакций — страховка от
+# непопадания в блок при перегрузке сети. Реальные последние fee на этот пул сейчас
+# в основном 0 (не перегружен), но скромная ненулевая цена почти ничего не стоит
+# (для лимита 400k CU это максимум ~0.002 SOL) и заметно повышает шанс попасть в блок.
+PRIORITY_FEE_MICROLAMPORTS = int(os.getenv("PRIORITY_FEE_MICROLAMPORTS", "5000"))
+# Резерв SOL под безвозвратную ренту открытия НОВОЙ позиции (position PDA + mint +
+# position ATA + Metaplex metadata) — отдельно от MIN_SOL_BALANCE, у которого другая роль
+# (порог алерта "мало SOL", не "сколько нужно на следующее открытие"). ~0.012-0.015 SOL
+# по факту реальных открытий сегодня; берём с запасом. Смешение этих двух ролей в одну
+# константу — реальный баг, найденный независимо тремя аудитами (Grok 4.5, GPT-5.2,
+# Opus 4.8, 2026-07-26): без отдельного резерва ребаланс мог потратить SOL до самой
+# границы MIN_SOL_BALANCE, а потом ещё и ренту сверху — уходя ниже порога алерта сразу
+# после "успешного" ребаланса.
+OPEN_POSITION_RENT_RESERVE_SOL = float(os.getenv("OPEN_POSITION_RENT_RESERVE_SOL", "0.02"))
 
 _PLACEHOLDER_MARKERS = (
     "YOUR_",
