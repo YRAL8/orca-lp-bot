@@ -146,6 +146,14 @@ async def notify_low_sol_balance(balance: float) -> None:
     )
 
 
+async def notify_rpc_down(ticks: int) -> None:
+    """Уведомление о недоступности RPC после серии подряд ошибок."""
+    await send_message(
+        f"❌ <b>RPC недоступен</b>\n"
+        f"Мониторинг не работает уже {ticks} тиков подряд."
+    )
+
+
 def format_position_balance(position) -> str:
     """Текстовый блок: состав позиции SOL/USDC в USD."""
     demo_note = f"\n<i>(демо ~${DEMO_DEPOSIT_USD:.0f}, задай POSITION_MINT)</i>" if getattr(position, "is_demo", False) else ""
