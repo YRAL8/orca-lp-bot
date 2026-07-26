@@ -219,11 +219,18 @@ async def main() -> None:
     log.info("=" * 50)
 
     # Загружаем позицию при старте
-    position = await get_position()
-    tg.current_position = position
+    try:
+        position = await get_position()
+        tg.current_position = position
+    except Exception as e:
+        tg.current_position = None
+        log.exception("Не удалось получить позицию при старте: %s", e)
 
     # Уведомляем о запуске
-    await tg.notify_startup()
+    try:
+        await tg.notify_startup()
+    except Exception as e:
+        log.exception("Не удалось отправить startup-уведомление: %s", e)
 
     # Настраиваем планировщик
     scheduler = AsyncIOScheduler()
@@ -248,24 +255,41 @@ async def main() -> None:
     log.info(f"Планировщик запущен. Мониторинг каждые {POLL_INTERVAL_SEC} сек")
 
     # Запускаем Telegram бота для команды /status
+    telegram_polling_started = False
     if not is_placeholder(TELEGRAM_BOT_TOKEN):
         app = tg.build_telegram_app()
-        async with app:
-            await app.start()
-            await app.updater.start_polling()
-            log.info("Telegram бот запущен, команда /status активна")
-
-            # Бесконечный цикл
+        try:
+            await app.bot.get_me()
+        except Exception as e:
+            log.exception(
+                "Telegram токен невалиден или API недоступен, работаем без /status: %s",
+                e,
+            )
+        else:
             try:
-                while True:
-                    await asyncio.sleep(1)
-            except (KeyboardInterrupt, SystemExit):
-                log.info("Остановка бота...")
-            finally:
-                await app.updater.stop()
-                await app.stop()
-    else:
-        log.warning("Telegram токен не задан, /status недоступен")
+                async with app:
+                    await app.start()
+                    await app.updater.start_polling()
+                    telegram_polling_started = True
+                    log.info("Telegram бот запущен, команда /status активна")
+
+                    # Бесконечный цикл
+                    try:
+                        while True:
+                            await asyncio.sleep(1)
+                    except (KeyboardInterrupt, SystemExit):
+                        log.info("Остановка бота...")
+                    finally:
+                        await app.updater.stop()
+                        await app.stop()
+            except Exception as e:
+                log.exception("Ошибка запуска Telegram, продолжаем без /status: %s", e)
+
+    if is_placeholder(TELEGRAM_BOT_TOKEN) or not telegram_polling_started:
+        if is_placeholder(TELEGRAM_BOT_TOKEN):
+            log.warning("Telegram токен не задан, /status недоступен")
+        else:
+            log.warning("Telegram /status отключён из-за ошибки токена или API")
         try:
             while True:
                 await asyncio.sleep(1)
