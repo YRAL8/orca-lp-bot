@@ -308,6 +308,19 @@ async def get_position() -> Optional[Position]:
                 pos = _demo_position(current_price)
                 tick_lower = _price_to_tick(pos.lower_price, dec_a, dec_b, whirlpool.tick_spacing)
                 tick_upper = _price_to_tick(pos.upper_price, dec_a, dec_b, whirlpool.tick_spacing)
+                # Align displayed range with ticks used for amounts (rounding can be asymmetric).
+                pos.lower_price = float(
+                    DecimalUtil.to_fixed(
+                        PriceMath.tick_index_to_price(tick_lower, dec_a, dec_b),
+                        dec_b,
+                    )
+                )
+                pos.upper_price = float(
+                    DecimalUtil.to_fixed(
+                        PriceMath.tick_index_to_price(tick_upper, dec_a, dec_b),
+                        dec_b,
+                    )
+                )
                 pos = _fill_position_amounts(pos, whirlpool, tick_lower, tick_upper, dec_a, dec_b)
                 log.info(
                     "DEMO позиция ~$%.0f | SOL $%.2f + USDC $%.2f = $%.2f | диапазон $%.2f—$%.2f",
