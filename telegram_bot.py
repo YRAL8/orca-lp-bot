@@ -282,24 +282,31 @@ def format_price_trend(position) -> str:
 
 async def send_heartbeat(position) -> None:
     """Heartbeat сообщение каждые 4 часа."""
-    sol_balance = await get_sol_balance()
-    status = "✅ в диапазоне" if position.in_range else "❌ вне диапазона"
-    mode = "DRY RUN" if DRY_RUN else "БОЕВОЙ"
-    demo = " [демо]" if getattr(position, "is_demo", False) else ""
-    balance_line = (
-        f"Баланс кошелька: {sol_balance:.4f} SOL"
-        if sol_balance is not None
-        else "Кошелёк не настроен (read-only)"
-    )
+    try:
+        sol_balance = await get_sol_balance()
+        status = "✅ в диапазоне" if position.in_range else "❌ вне диапазона"
+        mode = "DRY RUN" if DRY_RUN else "БОЕВОЙ"
+        demo = " [демо]" if getattr(position, "is_demo", False) else ""
+        balance_line = (
+            f"Баланс кошелька: {sol_balance:.4f} SOL"
+            if sol_balance is not None
+            else "Кошелёк не настроен (read-only)"
+        )
 
-    await send_message(
-        f"💓 <b>Бот работает [{mode}]{demo}</b>\n"
-        f"{format_position_balance(position)}\n"
-        f"📈 Цена SOL: ${position.current_price:.2f}{format_price_trend(position)}\n"
-        f"{format_range_bar(position)}\n"
-        f"   Статус: {status}\n"
-        f"{balance_line}"
-    )
+        await send_message(
+            f"💓 <b>Бот работает [{mode}]{demo}</b>\n"
+            f"{format_position_balance(position)}\n"
+            f"📈 Цена SOL: ${position.current_price:.2f}{format_price_trend(position)}\n"
+            f"{format_range_bar(position)}\n"
+            f"   Статус: {status}\n"
+            f"{balance_line}"
+        )
+    except Exception as e:
+        log.exception("Не удалось сформировать heartbeat: %s", e)
+        try:
+            await send_message(f"⚠️ <b>Heartbeat не удался</b>\nОшибка: {e}")
+        except Exception:
+            log.exception("Не удалось отправить даже сообщение об ошибке heartbeat")
 
 
 async def _reply(
@@ -327,34 +334,38 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     from orca import get_position
 
-    position = await get_position()
-    if position is None:
-        await _reply(update, context, "⏳ Не удалось загрузить позицию")
-        return
+    try:
+        position = await get_position()
+        if position is None:
+            await _reply(update, context, "⏳ Не удалось загрузить позицию")
+            return
 
-    current_position = position
+        current_position = position
 
-    sol_balance = await get_sol_balance()
-    status = "✅ в диапазоне" if position.in_range else "❌ вне диапазона"
-    mode = "DRY RUN" if DRY_RUN else "БОЕВОЙ"
-    demo = " [демо]" if getattr(position, "is_demo", False) else ""
-    balance_line = (
-        f"Баланс SOL: {sol_balance:.4f}"
-        if sol_balance is not None
-        else "Кошелёк не настроен (read-only)"
-    )
+        sol_balance = await get_sol_balance()
+        status = "✅ в диапазоне" if position.in_range else "❌ вне диапазона"
+        mode = "DRY RUN" if DRY_RUN else "БОЕВОЙ"
+        demo = " [демо]" if getattr(position, "is_demo", False) else ""
+        balance_line = (
+            f"Баланс SOL: {sol_balance:.4f}"
+            if sol_balance is not None
+            else "Кошелёк не настроен (read-only)"
+        )
 
-    await _reply(
-        update,
-        context,
-        f"📊 <b>Статус [{mode}]{demo}</b>\n"
-        f"{format_position_balance(position)}\n"
-        f"📈 Цена SOL: ${position.current_price:.2f}{format_price_trend(position)}\n"
-        f"{format_range_bar(position)}\n"
-        f"   Статус: {status}\n"
-        f"{balance_line}",
-        parse_mode="HTML",
-    )
+        await _reply(
+            update,
+            context,
+            f"📊 <b>Статус [{mode}]{demo}</b>\n"
+            f"{format_position_balance(position)}\n"
+            f"📈 Цена SOL: ${position.current_price:.2f}{format_price_trend(position)}\n"
+            f"{format_range_bar(position)}\n"
+            f"   Статус: {status}\n"
+            f"{balance_line}",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        log.exception("Ошибка /status: %s", e)
+        await _reply(update, context, f"❌ Ошибка /status: {e}")
 
 
 async def setrange_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
