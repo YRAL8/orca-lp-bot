@@ -1,12 +1,46 @@
 import asyncio
+import logging
 from telegram import Update, Bot
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, filters
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DRY_RUN, DEMO_DEPOSIT_USD, is_placeholder
 from solana_client import get_sol_balance
 
+log = logging.getLogger(__name__)
 
 # Глобальная ссылка на текущую позицию (обновляется из main.py)
 current_position = None
+
+# Команды, доступные только владельцу (TELEGRAM_CHAT_ID).
+_OWNER_COMMANDS = ("status", "setrange")
+
+
+def _owner_chat_id() -> int | None:
+    """TELEGRAM_CHAT_ID как int, или None если пусто/плейсхолдер/нечисловое."""
+    if not TELEGRAM_CHAT_ID or is_placeholder(TELEGRAM_CHAT_ID):
+        return None
+    try:
+        return int(TELEGRAM_CHAT_ID)
+    except ValueError:
+        log.error(
+            "TELEGRAM_CHAT_ID=%r не число — команды /status и /setrange не зарегистрированы",
+            TELEGRAM_CHAT_ID,
+        )
+        return None
+
+
+async def unauthorized_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Логирует попытку вызвать команду из чужого чата — без ответа в Telegram."""
+    chat = update.effective_chat
+    chat_id = chat.id if chat is not None else None
+    text = update.effective_message.text if update.effective_message else None
+    command = (text.split()[0] if text else "?")
+    log.warning(
+        "Ignored Telegram command %s from unauthorized chat_id=%s",
+        command,
+        chat_id,
+    )
 
 
 async def send_message(text: str) -> None:
@@ -288,6 +322,24 @@ async def setrange_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 def build_telegram_app() -> Application:
     """Создаёт и настраивает Telegram приложение с командами."""
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("status", status_command))
-    app.add_handler(CommandHandler("setrange", setrange_command))
+
+    owner_id = _owner_chat_id()
+    if owner_id is None:
+        log.error(
+            "TELEGRAM_CHAT_ID не задан или некорректен — "
+            "/status и /setrange не зарегистрированы"
+        )
+        return app
+
+    owner_chat = filters.Chat(chat_id=owner_id)
+    app.add_handler(CommandHandler("status", status_command, filters=owner_chat))
+    app.add_handler(CommandHandler("setrange", setrange_command, filters=owner_chat))
+    # Чужие чаты: только warning в лог, без ответа (не светим, что бот живой).
+    app.add_handler(
+        CommandHandler(
+            list(_OWNER_COMMANDS),
+            unauthorized_command,
+            filters=~owner_chat,
+        )
+    )
     return app
