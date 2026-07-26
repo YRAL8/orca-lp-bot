@@ -18,11 +18,19 @@ from orca_whirlpool.context import WhirlpoolContext
 from orca_whirlpool.internal.types.enums import PositionStatus
 from orca_whirlpool.quote import (
     QuoteBuilder,
+    CollectFeesQuoteParams,
     DecreaseLiquidityQuoteParams,
     IncreaseLiquidityQuoteParams,
 )
 from orca_whirlpool.types import Percentage
-from orca_whirlpool.utils import DecimalUtil, PDAUtil, PositionUtil, PriceMath
+from orca_whirlpool.utils import (
+    DecimalUtil,
+    PDAUtil,
+    PositionUtil,
+    PriceMath,
+    TickArrayUtil,
+    TickUtil,
+)
 
 import config
 from config import (
@@ -91,6 +99,31 @@ async def _pool_price_and_decimals(ctx: WhirlpoolContext, whirlpool) -> tuple[fl
     symbol_a = _mint_symbol(str(whirlpool.token_mint_a))
     symbol_b = _mint_symbol(str(whirlpool.token_mint_b))
     return price, mint_a.decimals, mint_b.decimals, symbol_a, symbol_b
+
+
+async def _get_tick_for_index(
+    ctx: WhirlpoolContext,
+    whirlpool,
+    whirlpool_pubkey: Pubkey,
+    tick_index: int,
+):
+    start_tick_index = TickUtil.get_start_tick_index(
+        tick_index,
+        whirlpool.tick_spacing,
+    )
+    tick_array_pda = PDAUtil.get_tick_array(
+        ORCA_WHIRLPOOL_PROGRAM_ID,
+        whirlpool_pubkey,
+        start_tick_index,
+    )
+    tick_array = await ctx.fetcher.get_tick_array(tick_array_pda.pubkey)
+    if tick_array is None:
+        raise ValueError(f"TickArray не найден для start_tick_index={start_tick_index}")
+    return TickArrayUtil.get_tick_from_array(
+        tick_array,
+        tick_index,
+        whirlpool.tick_spacing,
+    )
 
 
 def _mint_symbol(mint: str) -> str:
@@ -391,10 +424,41 @@ async def get_position() -> Optional[Position]:
             on_chain.tick_lower_index,
             on_chain.tick_upper_index,
         )
+        fee_owed_a = on_chain.fee_owed_a
+        fee_owed_b = on_chain.fee_owed_b
+        try:
+            whirlpool_pubkey = Pubkey.from_string(WHIRLPOOL_ADDRESS)
+            tick_lower = await _get_tick_for_index(
+                ctx,
+                whirlpool,
+                whirlpool_pubkey,
+                on_chain.tick_lower_index,
+            )
+            tick_upper = await _get_tick_for_index(
+                ctx,
+                whirlpool,
+                whirlpool_pubkey,
+                on_chain.tick_upper_index,
+            )
+            fees_quote = QuoteBuilder.collect_fees(
+                CollectFeesQuoteParams(
+                    whirlpool=whirlpool,
+                    position=on_chain,
+                    tick_lower=tick_lower,
+                    tick_upper=tick_upper,
+                )
+            )
+            fee_owed_a = fees_quote.fee_a
+            fee_owed_b = fees_quote.fee_b
+        except Exception:
+            log.exception(
+                "Не удалось рассчитать актуальные on-chain fees quote, используем сырые fee_owed."
+            )
+
         fees_sol, fees_usdc = _split_fees(
             whirlpool,
-            on_chain.fee_owed_a,
-            on_chain.fee_owed_b,
+            fee_owed_a,
+            fee_owed_b,
             dec_a,
             dec_b,
         )
