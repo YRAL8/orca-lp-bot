@@ -1,14 +1,28 @@
 import asyncio
 import logging
+from collections import deque
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, ContextTypes, filters
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DRY_RUN, DEMO_DEPOSIT_USD, REBALANCE_DELAY_MIN, is_placeholder
+from config import (
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID,
+    DRY_RUN,
+    AUTO_REBALANCE,
+    DEMO_DEPOSIT_USD,
+    REBALANCE_DELAY_MIN,
+    is_placeholder,
+)
 from solana_client import get_sol_balance
 
 log = logging.getLogger(__name__)
 
 # Глобальная ссылка на текущую позицию (обновляется из main.py)
 current_position = None
+
+# История цен для sparkline (обновляется из main.py / monitor_position)
+price_history: deque[float] = deque(maxlen=12)
+
+_SPARK_CHARS = "▁▂▃▄▅▆▇█"
 
 # Ленивый singleton Bot — создаётся при первом реальном send_message().
 _bot: Bot | None = None
@@ -74,21 +88,32 @@ async def send_message(text: str) -> None:
 
 
 async def notify_startup() -> None:
-    """Уведомление о запуске бота."""
+    """Уведомление о запуске бота — явно показывает DRY_RUN / AUTO_REBALANCE."""
     from config import POLL_INTERVAL_SEC, RANGE_WIDTH_PCT, POSITION_MINT
 
-    mode = "🔸 DRY RUN (без транзакций)" if DRY_RUN else "🟢 БОЕВОЙ режим"
-    demo = (
-        "\n📎 Демо-позиция (задай POSITION_MINT)"
-        if is_placeholder(POSITION_MINT)
-        else ""
-    )
+    if DRY_RUN:
+        dry = "DRY RUN"
+    else:
+        dry = "БОЕВОЙ"
+    if AUTO_REBALANCE:
+        mode = f"{dry} · авто-ребаланс (AUTO_REBALANCE=on)"
+        range_line = f"Диапазон при ребалансе: ±{RANGE_WIDTH_PCT:g}%"
+    else:
+        mode = f"{dry} · только наблюдение (AUTO_REBALANCE=off)"
+        range_line = f"Диапазон при будущем ребалансе: ±{RANGE_WIDTH_PCT:g}%"
+
+    poll_min = POLL_INTERVAL_SEC // 60
+    if is_placeholder(POSITION_MINT):
+        position_line = "Позиция: демо (задай POSITION_MINT)"
+    else:
+        position_line = "Позиция: on-chain"
+
     await send_message(
         f"🤖 <b>Бот запущен</b>\n"
-        f"{mode}\n"
-        f"Пара: SOL/USDC\n"
-        f"Новый диапазон при rebalance: ±{RANGE_WIDTH_PCT}%\n"
-        f"Мониторинг каждые {POLL_INTERVAL_SEC // 60} мин{demo}"
+        f"Режим: {mode}\n"
+        f"Пара: SOL/USDC · опрос {poll_min} мин · задержка {REBALANCE_DELAY_MIN} мин\n"
+        f"{range_line}\n"
+        f"{position_line}"
     )
 
 
@@ -170,14 +195,27 @@ async def notify_rpc_down(ticks: int) -> None:
 
 
 def format_position_balance(position) -> str:
-    """Текстовый блок: состав позиции SOL/USDC в USD."""
-    demo_note = f"\n<i>(демо ~${DEMO_DEPOSIT_USD:.0f}, задай POSITION_MINT)</i>" if getattr(position, "is_demo", False) else ""
+    """Состав позиции SOL/USDC — моноширинная таблица в <pre>."""
+    demo_note = (
+        f"\n<i>(демо ~${DEMO_DEPOSIT_USD:.0f}, задай POSITION_MINT)</i>"
+        if getattr(position, "is_demo", False)
+        else ""
+    )
+    usd_sol = f"${position.value_sol_usd:.2f}"
+    usd_usdc = f"${position.value_usdc_usd:.2f}"
+    usd_total = f"${position.total_value_usd:.2f}"
+    usd_fees = f"${position.fees_total_usd:.2f}"
+    table = (
+        f"{'':5}{'qty':>8}  {'USD':>8}\n"
+        f"{'SOL':5}{position.amount_sol:>8.4f}  {usd_sol:>8}\n"
+        f"{'USDC':5}{position.amount_usdc:>8.2f}  {usd_usdc:>8}\n"
+        f"{'─' * 23}\n"
+        f"{'TOTAL':5}{'':8}  {usd_total:>8}\n"
+        f"{'Fees':5}{'':8}  {usd_fees:>8}"
+    )
     return (
         f"💰 <b>Позиция: ${position.total_value_usd:.2f}</b>{demo_note}\n"
-        f"   SOL:  {position.amount_sol:.4f}  (${position.value_sol_usd:.2f})\n"
-        f"   USDC: {position.amount_usdc:.2f}  (${position.value_usdc_usd:.2f})\n"
-        f"💵 Fees: {position.fees_sol:.4f} SOL + ${position.fees_usdc:.2f} USDC "
-        f"(≈${position.fees_total_usd:.2f})"
+        f"<pre>{table}</pre>"
     )
 
 
@@ -202,6 +240,61 @@ def format_range(position) -> str:
     )
 
 
+def format_range_bar(position) -> str:
+    """Прогресс-бар положения цены в диапазоне (16 символов █/░)."""
+    span = position.upper_price - position.lower_price
+    if span > 0:
+        pct = (position.current_price - position.lower_price) / span
+    else:
+        pct = 0.5
+
+    pct_clamped = max(0.0, min(1.0, pct))
+    filled = round(pct_clamped * 16)
+    filled = max(0, min(16, filled))
+    bar = "█" * filled + "░" * (16 - filled)
+
+    if pct < 0:
+        extra = f" ↓ {pct * 100:.1f}%"
+    elif pct > 1:
+        extra = f" ↑ +{(pct - 1) * 100:.1f}%"
+    else:
+        extra = ""
+
+    return (
+        f"<code>{bar}</code>{extra}\n"
+        f"L ${position.lower_price:.2f}  "
+        f"C ${position.current_price:.2f}  "
+        f"U ${position.upper_price:.2f}"
+    )
+
+
+def format_sparkline() -> str:
+    """Мини-график последних цен из price_history; пустая строка если < 2 точек."""
+    if len(price_history) < 2:
+        return ""
+    prices = list(price_history)
+    lo = min(prices)
+    hi = max(prices)
+    if hi <= lo:
+        levels = [3] * len(prices)
+    else:
+        levels = [int((p - lo) / (hi - lo) * 7) for p in prices]
+    spark = "".join(_SPARK_CHARS[level] for level in levels)
+    return f"<code>{spark}</code>"
+
+
+def _range_and_spark_section(position, *, include_format_range: bool) -> str:
+    """Секция диапазона + опциональный sparkline под баром."""
+    parts: list[str] = []
+    if include_format_range:
+        parts.append(format_range(position))
+    parts.append(format_range_bar(position))
+    spark = format_sparkline()
+    if spark:
+        parts.append(spark)
+    return "\n".join(parts)
+
+
 async def send_heartbeat(position) -> None:
     """Heartbeat сообщение каждые 4 часа."""
     sol_balance = await get_sol_balance()
@@ -214,11 +307,12 @@ async def send_heartbeat(position) -> None:
         else "Кошелёк не настроен (read-only)"
     )
 
+    # Вариант A: бар вместо процентной строки format_range (см. discussion 2026-07-26)
     await send_message(
         f"💓 <b>Бот работает [{mode}]{demo}</b>\n"
         f"{format_position_balance(position)}\n"
         f"📈 Цена SOL: ${position.current_price:.2f}\n"
-        f"{format_range(position)}\n"
+        f"{_range_and_spark_section(position, include_format_range=False)}\n"
         f"   Статус: {status}\n"
         f"{balance_line}"
     )
@@ -266,13 +360,14 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         else "Кошелёк не настроен (read-only)"
     )
 
+    # Вариант A: бар вместо процентной строки format_range (см. discussion 2026-07-26)
     await _reply(
         update,
         context,
         f"📊 <b>Статус [{mode}]{demo}</b>\n"
         f"{format_position_balance(position)}\n"
         f"📈 Цена SOL: ${position.current_price:.2f}\n"
-        f"{format_range(position)}\n"
+        f"{_range_and_spark_section(position, include_format_range=False)}\n"
         f"   Статус: {status}\n"
         f"{balance_line}",
         parse_mode="HTML",

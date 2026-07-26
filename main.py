@@ -92,6 +92,7 @@ async def monitor_position() -> None:
 
         # Обновляем глобальную позицию для /status
         tg.current_position = position
+        tg.price_history.append(position.current_price)
 
         log.info(
             f"Цена: ${position.current_price:.2f} | "
