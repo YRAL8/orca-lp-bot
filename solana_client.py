@@ -1,5 +1,6 @@
 import base58
 from solana.rpc.async_api import AsyncClient
+from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 
 from config import WALLET_PRIVATE_KEY, MIN_SOL_BALANCE, get_rpc_url, wallet_configured
@@ -22,7 +23,7 @@ def get_wallet_pubkey() -> Pubkey | None:
     if len(decoded) == 64:
         return Pubkey.from_bytes(decoded[32:])
     if len(decoded) == 32:
-        return Pubkey.from_bytes(decoded)
+        return Keypair.from_seed(decoded).pubkey()
     raise ValueError(
         "WALLET_PRIVATE_KEY: ожидается base58 строка (32 или 64 байта после декодирования)"
     )
