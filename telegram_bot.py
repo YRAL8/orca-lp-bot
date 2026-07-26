@@ -2,7 +2,7 @@ import asyncio
 import logging
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, ContextTypes, filters
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DRY_RUN, DEMO_DEPOSIT_USD, is_placeholder
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DRY_RUN, DEMO_DEPOSIT_USD, REBALANCE_DELAY_MIN, is_placeholder
 from solana_client import get_sol_balance
 
 log = logging.getLogger(__name__)
@@ -83,7 +83,7 @@ async def notify_out_of_range(position) -> None:
         f"⚠️ <b>Цена вышла за границу!</b>\n"
         f"Текущая цена: ${position.current_price:.2f}\n"
         f"Диапазон: ${position.lower_price:.2f} — ${position.upper_price:.2f}\n"
-        f"⏳ Жду 20 минут перед ребалансом..."
+        f"⏳ Жду {REBALANCE_DELAY_MIN} минут перед ребалансом..."
     )
 
 
