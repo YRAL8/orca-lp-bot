@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from dotenv import find_dotenv, set_key
@@ -91,6 +92,40 @@ class Position:
 
 async def _get_context(client: AsyncClient) -> WhirlpoolContext:
     return WhirlpoolContext(ORCA_WHIRLPOOL_PROGRAM_ID, client, Keypair())
+
+
+async def _get_signature_status_with_retry(
+    client: AsyncClient,
+    signature,
+    retries: int = 5,
+    base_delay: float = 1.0,
+):
+    """
+    client.get_signature_statuses() с retry+backoff — публичный RPC под нагрузкой
+    (много реальных транзакций подряд) может ответить 429. Транзакция при этом уже
+    реально отправлена (build_and_execute успел сделать send_raw_transaction) — сама
+    отправка не откатывается из-за ошибки этой ПОСЛЕДУЮЩЕЙ проверки статуса, так что
+    без retry мы теряем возможность узнать (и сохранить) результат уже случившейся
+    транзакции (найдено вживую: реальный 429 во время автоматического триггера
+    ребаланса, 2026-07-26).
+    """
+    last_error = None
+    for attempt in range(retries):
+        try:
+            return await client.get_signature_statuses([signature])
+        except Exception as e:
+            last_error = e
+            if attempt < retries - 1:
+                delay = base_delay * (2 ** attempt)
+                log.warning(
+                    "get_signature_statuses не удался (попытка %d/%d): %s — повтор через %.1fс",
+                    attempt + 1,
+                    retries,
+                    e,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+    raise last_error
 
 
 async def _load_whirlpool(ctx: WhirlpoolContext):
@@ -618,7 +653,7 @@ async def collect_fees(position: Position) -> tuple[float, float]:
         )
 
         signature = await tx_builder.build_and_execute()
-        status_resp = await client.get_signature_statuses([signature])
+        status_resp = await _get_signature_status_with_retry(client, signature)
         status = status_resp.value[0]
         if status is None or status.err is not None:
             raise RuntimeError(
@@ -818,7 +853,7 @@ async def close_position(position: Position) -> bool:
             log.info("On-chain liquidity already zero: skip decrease_liquidity")
 
         signature = await tx_builder.build_and_execute()
-        status_resp = await client.get_signature_statuses([signature])
+        status_resp = await _get_signature_status_with_retry(client, signature)
         status = status_resp.value[0]
         if status is None or status.err is not None:
             raise RuntimeError(
@@ -1270,7 +1305,7 @@ async def open_position(current_price: float, usdc_amount: Optional[float] = Non
         # этом провалиться on-chain (например, если цена ушла за пределы slippage между
         # отправкой и приёмом в блок). Перепроверяем сами (найдено независимым аудитом,
         # Opus 4.8, 2026-07-26).
-        status_resp = await client.get_signature_statuses([signature])
+        status_resp = await _get_signature_status_with_retry(client, signature)
         status = status_resp.value[0]
         if status is None or status.err is not None:
             raise RuntimeError(

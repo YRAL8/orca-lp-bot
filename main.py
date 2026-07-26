@@ -27,8 +27,18 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
-# Флаг чтобы не запускать два ребаланса одновременно
-rebalance_in_progress = False
+# Раньше был обычный bool-флаг (rebalance_in_progress) — между его проверкой в начале
+# monitor_position() и фактическим выставлением в True перед ребалансом происходит
+# несколько await (get_sol_balance, get_position, get_current_price), т.е. в принципе
+# небезопасное для параллельного входа окно. Live-прогон 2026-07-26 напечатал
+# "Начинаем ребаланс..." дважды подряд — расследование показало, что это НЕ гонка:
+# это две разные строчки лога (одна в monitor_position(), другая в orca.rebalance()
+# — там текст "Начинаем ребаланс%s..." с DRY_RUN-суффиксом), которые совпадают
+# по тексту только когда DRY_RUN=False. Реальной параллельности не было — только
+# один close/open прошёл. asyncio.Lock здесь оставлен как более надёжный примитив
+# взамен bool-флага (не полагается на порядок await), а не как фикс подтверждённого
+# бага.
+_rebalance_lock = asyncio.Lock()
 
 # Время когда цена первый раз вышла за границу
 out_of_range_since: datetime = None
@@ -63,10 +73,12 @@ async def monitor_position() -> None:
     Основной цикл мониторинга.
     Запускается каждые POLL_INTERVAL_SEC секунд.
     """
-    global rebalance_in_progress, out_of_range_since, stale_alert_sent, low_sol_alert_sent, rpc_error_streak, rpc_down_alert_sent
+    global out_of_range_since, stale_alert_sent, low_sol_alert_sent, rpc_error_streak, rpc_down_alert_sent
 
-    # Если уже идёт ребаланс — пропускаем
-    if rebalance_in_progress:
+    # Если уже идёт ребаланс — пропускаем. Проверка + вход в lock ниже идут без await
+    # между ними, так что в однопоточном asyncio-цикле это безопасно (в отличие от
+    # прежнего bool-флага, выставлявшегося только в конце после нескольких await).
+    if _rebalance_lock.locked():
         log.info("Ребаланс в процессе, пропускаем мониторинг")
         return
 
@@ -170,29 +182,26 @@ async def monitor_position() -> None:
             return
 
         # Делаем ребаланс
-        rebalance_in_progress = True
         out_of_range_since = None
 
-        try:
-            log.info("Начинаем ребаланс...")
-            await tg.notify_rebalance_start(position)
+        async with _rebalance_lock:
+            try:
+                log.info("Начинаем ребаланс...")
+                await tg.notify_rebalance_start(position)
 
-            new_position = await rebalance(position)
+                new_position = await rebalance(position)
 
-            if new_position:
-                tg.current_position = new_position
-                await tg.notify_rebalance_complete(position, new_position)
-                log.info(f"Ребаланс завершён. Новый диапазон: ${new_position.lower_price:.2f}—${new_position.upper_price:.2f}")
-            else:
-                await tg.notify_rebalance_error("Не удалось выполнить ребаланс")
-                log.error("Ребаланс не удался")
+                if new_position:
+                    tg.current_position = new_position
+                    await tg.notify_rebalance_complete(position, new_position)
+                    log.info(f"Ребаланс завершён. Новый диапазон: ${new_position.lower_price:.2f}—${new_position.upper_price:.2f}")
+                else:
+                    await tg.notify_rebalance_error("Не удалось выполнить ребаланс")
+                    log.error("Ребаланс не удался")
 
-        except Exception as e:
-            log.exception(f"Ошибка при ребалансе: {e}")
-            await tg.notify_rebalance_error(str(e))
-
-        finally:
-            rebalance_in_progress = False
+            except Exception as e:
+                log.exception(f"Ошибка при ребалансе: {e}")
+                await tg.notify_rebalance_error(str(e))
 
         _reset_rpc_error_state()
     except Exception as e:
