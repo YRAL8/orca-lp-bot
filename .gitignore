@@ -4,3 +4,6 @@ __pycache__/
 .env
 bot.log
 *.log
+
+# Private planning notes — not for the public repo
+ROADMAP.md
