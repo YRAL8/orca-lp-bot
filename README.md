@@ -71,6 +71,20 @@ requirements.txt  — зависимости
 bot.log           — логи работы бота
 ```
 
+## Запуск через Docker
+
+Скопируй `env_template` в `.env` и заполни переменные, затем:
+
+```bash
+docker compose up -d --build
+```
+
+Логи:
+
+```bash
+docker compose logs -f
+```
+
 ## Запуск на VPS (после тестирования)
 
 ```bash
