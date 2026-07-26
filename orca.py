@@ -24,10 +24,10 @@ from orca_whirlpool.quote import (
 from orca_whirlpool.types import Percentage
 from orca_whirlpool.utils import DecimalUtil, PDAUtil, PositionUtil, PriceMath
 
+import config
 from config import (
     WHIRLPOOL_ADDRESS,
     POSITION_MINT,
-    RANGE_WIDTH_PCT,
     DRY_RUN,
     DEMO_POSITION,
     DEMO_DEPOSIT_USD,
@@ -274,8 +274,8 @@ def _fill_position_amounts(
 
 
 def _demo_position(current_price: float) -> Position:
-    lower = current_price * (1 - RANGE_WIDTH_PCT / 100)
-    upper = current_price * (1 + RANGE_WIDTH_PCT / 100)
+    lower = current_price * (1 - config.RANGE_WIDTH_PCT / 100)
+    upper = current_price * (1 + config.RANGE_WIDTH_PCT / 100)
     return Position(
         mint="DEMO",
         lower_price=lower,
@@ -412,15 +412,15 @@ async def close_position(position: Position) -> bool:
 
 
 async def open_position(current_price: float) -> Optional[Position]:
-    lower = current_price * (1 - RANGE_WIDTH_PCT / 100)
-    upper = current_price * (1 + RANGE_WIDTH_PCT / 100)
+    lower = current_price * (1 - config.RANGE_WIDTH_PCT / 100)
+    upper = current_price * (1 + config.RANGE_WIDTH_PCT / 100)
 
     if DRY_RUN:
         log.info(
             "DRY RUN: open_position — диапазон $%.4f—$%.4f (±%.1f%%)",
             lower,
             upper,
-            RANGE_WIDTH_PCT,
+            config.RANGE_WIDTH_PCT,
         )
         return Position(
             mint="DRY_RUN_NEW",
