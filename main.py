@@ -37,25 +37,34 @@ out_of_range_since: datetime = None
 # для текущего выхода из диапазона? Чтобы не повторять каждые 5 минут.
 stale_alert_sent = False
 
+# Уже отправили алерт о низком SOL? Чтобы не повторять каждые 5 минут,
+# пока баланс не вернётся выше MIN_SOL_BALANCE.
+low_sol_alert_sent = False
+
 
 async def monitor_position() -> None:
     """
     Основной цикл мониторинга.
     Запускается каждые POLL_INTERVAL_SEC секунд.
     """
-    global rebalance_in_progress, out_of_range_since, stale_alert_sent
+    global rebalance_in_progress, out_of_range_since, stale_alert_sent, low_sol_alert_sent
 
     # Если уже идёт ребаланс — пропускаем
     if rebalance_in_progress:
         log.info("Ребаланс в процессе, пропускаем мониторинг")
         return
 
-    # Проверяем баланс SOL (пропускаем, если кошелёк не настроен — read-only dry-run)
+    # Анти-спам по SOL: обновляем каждый тик, но мониторинг диапазона не блокируем.
+    # (пропускаем, если кошелёк не настроен — read-only dry-run, balance is None)
     sol_balance = await get_sol_balance()
-    if sol_balance is not None and sol_balance < MIN_SOL_BALANCE:
-        await tg.notify_low_sol_balance(sol_balance)
-        log.warning(f"Низкий баланс SOL: {sol_balance:.4f}")
-        return
+    if sol_balance is not None:
+        if sol_balance < MIN_SOL_BALANCE:
+            if not low_sol_alert_sent:
+                await tg.notify_low_sol_balance(sol_balance)
+                log.warning(f"Низкий баланс SOL: {sol_balance:.4f}")
+                low_sol_alert_sent = True
+        else:
+            low_sol_alert_sent = False
 
     # Читаем позицию
     position = await get_position()
@@ -124,6 +133,15 @@ async def monitor_position() -> None:
         tg.current_position = position
         log.info("Цена вернулась в диапазон, ребаланс отменён")
         await tg.notify_price_returned(position)
+        return
+
+    # Низкий SOL блокирует только реальное действие, не мониторинг.
+    # out_of_range_since не трогаем — на следующем тике попробуем снова.
+    if sol_balance is not None and sol_balance < MIN_SOL_BALANCE:
+        if not low_sol_alert_sent:
+            await tg.notify_low_sol_balance(sol_balance)
+            low_sol_alert_sent = True
+        log.warning(f"Низкий баланс SOL: {sol_balance:.4f} — ребаланс отложен")
         return
 
     # Делаем ребаланс
