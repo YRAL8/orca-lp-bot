@@ -364,6 +364,8 @@ async def setrange_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     import config
     from orca import get_position, reset_demo_range
 
+    old_pct = config.RANGE_WIDTH_PCT
+
     try:
         if not context.args:
             await _reply(
@@ -424,6 +426,11 @@ async def setrange_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             parse_mode="HTML",
         )
     except Exception as e:
+        # Атомарность: если RANGE_WIDTH_PCT успел измениться до сбоя — откатываем,
+        # чтобы сообщение "❌ Ошибка" не расходилось с реальным состоянием конфига.
+        if config.RANGE_WIDTH_PCT != old_pct:
+            config.RANGE_WIDTH_PCT = old_pct
+            reset_demo_range()
         await _reply(
             update,
             context,
