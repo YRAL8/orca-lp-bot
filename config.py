@@ -19,6 +19,10 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 # Настройки бота
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+# Мониторинг vs действие — независимо от DRY_RUN. Пока close/open/collect_fees
+# для реальных транзакций не реализованы (см. orca.py), держим false: бот
+# только следит за диапазоном и шлёт алерты, не пытается ребалансить.
+AUTO_REBALANCE = os.getenv("AUTO_REBALANCE", "false").lower() == "true"
 RANGE_WIDTH_PCT = float(os.getenv("RANGE_WIDTH_PCT", "8"))
 POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "300"))
 REBALANCE_DELAY_MIN = int(os.getenv("REBALANCE_DELAY_MIN", "20"))

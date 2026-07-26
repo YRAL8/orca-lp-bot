@@ -8,7 +8,7 @@ from orca import get_position, rebalance, get_current_price
 from solana_client import get_sol_balance, check_sol_balance
 from config import (
     POLL_INTERVAL_SEC, REBALANCE_DELAY_MIN,
-    HEARTBEAT_INTERVAL_HOURS, DRY_RUN, MIN_SOL_BALANCE,
+    HEARTBEAT_INTERVAL_HOURS, DRY_RUN, AUTO_REBALANCE, MIN_SOL_BALANCE,
     TELEGRAM_BOT_TOKEN, is_placeholder,
 )
 
@@ -29,13 +29,17 @@ rebalance_in_progress = False
 # Время когда цена первый раз вышла за границу
 out_of_range_since: datetime = None
 
+# В режиме AUTO_REBALANCE=false: уже отправили «нужен ручной ребаланс»
+# для текущего выхода из диапазона? Чтобы не повторять каждые 5 минут.
+stale_alert_sent = False
+
 
 async def monitor_position() -> None:
     """
     Основной цикл мониторинга.
     Запускается каждые POLL_INTERVAL_SEC секунд.
     """
-    global rebalance_in_progress, out_of_range_since
+    global rebalance_in_progress, out_of_range_since, stale_alert_sent
 
     # Если уже идёт ребаланс — пропускаем
     if rebalance_in_progress:
@@ -68,7 +72,12 @@ async def monitor_position() -> None:
 
     # Цена внутри диапазона — всё хорошо
     if position.in_range:
+        # Если до этого копился «стухший» алерт — сообщаем, что цена вернулась
+        if out_of_range_since is not None and stale_alert_sent:
+            await tg.notify_price_returned(position)
+            log.info("Цена вернулась в диапазон")
         out_of_range_since = None
+        stale_alert_sent = False
         return
 
     # Цена вышла за границу
@@ -77,6 +86,7 @@ async def monitor_position() -> None:
     if out_of_range_since is None:
         # Первый раз фиксируем выход
         out_of_range_since = now
+        stale_alert_sent = False
         log.warning(f"Цена вышла за границу! Жду {REBALANCE_DELAY_MIN} минут...")
         await tg.notify_out_of_range(position)
         return
@@ -86,6 +96,16 @@ async def monitor_position() -> None:
 
     if minutes_out < REBALANCE_DELAY_MIN:
         log.info(f"Цена вне диапазона {minutes_out:.1f} мин из {REBALANCE_DELAY_MIN} мин")
+        return
+
+    if not AUTO_REBALANCE:
+        # Только наблюдение: сообщаем один раз, что пора вмешаться вручную,
+        # и молчим дальше, пока цена сама не вернётся в диапазон (см. выше).
+        # Реальный ребаланс (close/open позиции) ещё не реализован в orca.py.
+        if not stale_alert_sent:
+            await tg.notify_manual_action_needed(position)
+            log.warning("Цена вне диапазона дольше %d мин — нужен ручной ребаланс (AUTO_REBALANCE=false)", REBALANCE_DELAY_MIN)
+            stale_alert_sent = True
         return
 
     # Прошло 20 минут — проверяем ещё раз актуальную цену

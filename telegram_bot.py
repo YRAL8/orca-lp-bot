@@ -63,6 +63,18 @@ async def notify_price_returned(position) -> None:
     )
 
 
+async def notify_manual_action_needed(position) -> None:
+    """Watch-only режим (AUTO_REBALANCE=false): цена вне диапазона дольше
+    порога ожидания — бот сам ничего не делает, нужно вмешаться вручную."""
+    await send_message(
+        f"🔔 <b>Нужен ручной ребаланс</b>\n"
+        f"Текущая цена: ${position.current_price:.2f}\n"
+        f"Диапазон: ${position.lower_price:.2f} — ${position.upper_price:.2f}\n"
+        f"Бот в режиме наблюдения — автоматических действий не будет.\n"
+        f"Дальше сообщу, когда цена сама вернётся в диапазон."
+    )
+
+
 async def notify_rebalance_start(position) -> None:
     """Уведомление о начале ребаланса."""
     await send_message(
