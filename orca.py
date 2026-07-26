@@ -549,6 +549,16 @@ async def open_position(current_price: float) -> Optional[Position]:
             upper,
             config.RANGE_WIDTH_PCT,
         )
+        # Синхронизируем демо-кэш с только что "открытой" позицией — иначе
+        # следующий get_position() в demo-режиме вернёт старый диапазон,
+        # будто ребаланса не было (найдено при аудите 2026-07-26).
+        global _demo_range
+        _demo_range = {
+            "lower_price": lower,
+            "upper_price": upper,
+            "tick_lower": tick_lower,
+            "tick_upper": tick_upper,
+        }
         return Position(
             mint="DRY_RUN_NEW",
             lower_price=lower,
