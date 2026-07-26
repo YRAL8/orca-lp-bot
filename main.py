@@ -21,6 +21,10 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+# httpx/httpcore/telegram на INFO логируют полные URL (с bot token / api-key).
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 # Флаг чтобы не запускать два ребаланса одновременно
