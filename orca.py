@@ -867,15 +867,27 @@ async def close_position(position: Position) -> bool:
         # (тот же класс проблемы, что и при open — Opus 4.8, 2026-07-26). Если это
         # часть rebalance(), следующий сразу за этим open_position() перезапишет
         # значение новым mint'ом.
+        # In-memory обновляем ВСЕГДА (это то, чем реально пользуется живой процесс:
+        # get_position()/monitor_position() читают модульный POSITION_MINT, а не файл).
+        # Раньше это было вложено внутрь "if dotenv_path" — в Docker-контейнере
+        # find_dotenv() всегда возвращает пусто (docker-compose передаёт .env как
+        # переменные окружения, не монтирует сам файл), так что in-memory обновление
+        # никогда не срабатывало на сервере — бот считал позицию старой/закрытой
+        # даже после успешного реального ребаланса (поймано вживую через /rebalance
+        # на сервере, 2026-07-26).
+        global POSITION_MINT
+        POSITION_MINT = "YOUR_POSITION_NFT_MINT"
+        config.POSITION_MINT = "YOUR_POSITION_NFT_MINT"
+
         dotenv_path = find_dotenv()
         if dotenv_path:
             set_key(dotenv_path, "POSITION_MINT", "YOUR_POSITION_NFT_MINT", quote_mode="never")
-            global POSITION_MINT
-            POSITION_MINT = "YOUR_POSITION_NFT_MINT"
-            config.POSITION_MINT = "YOUR_POSITION_NFT_MINT"
             log.info("POSITION_MINT сброшен в .env после закрытия позиции")
         else:
-            log.warning("Не удалось найти .env — POSITION_MINT не сброшен после закрытия")
+            log.warning(
+                "Не удалось найти .env файл на диске (ожидаемо в Docker) — "
+                "POSITION_MINT сброшен только в памяти процесса, не в файле"
+            )
 
         return True
 
@@ -1319,18 +1331,27 @@ async def open_position(current_price: float, usdc_amount: Optional[float] = Non
         # независимым аудитом, Opus 4.8, 2026-07-26). Обновляем и in-memory значения
         # (config.POSITION_MINT + локальное POSITION_MINT в этом модуле), чтобы это
         # подхватилось в том же процессе без рестарта.
+        # In-memory обновляем ВСЕГДА — это то, чем реально пользуется живой процесс
+        # (get_position()/monitor_position() читают модульный POSITION_MINT, а не
+        # файл). Раньше это было вложено внутрь "if dotenv_path" — в Docker-контейнере
+        # find_dotenv() всегда возвращает пусто (docker-compose передаёт .env как
+        # переменные окружения, не монтирует сам файл), так что in-memory обновление
+        # никогда не срабатывало на сервере: после реального ребаланса бот продолжал
+        # думать, что активна старая (уже закрытая) позиция (поймано вживую через
+        # /rebalance на сервере, 2026-07-26).
         new_mint_str = str(position_mint)
+        global POSITION_MINT
+        POSITION_MINT = new_mint_str
+        config.POSITION_MINT = new_mint_str
+
         dotenv_path = find_dotenv()
         if dotenv_path:
             set_key(dotenv_path, "POSITION_MINT", new_mint_str, quote_mode="never")
-            global POSITION_MINT
-            POSITION_MINT = new_mint_str
-            config.POSITION_MINT = new_mint_str
             log.info("POSITION_MINT сохранён в .env: %s", new_mint_str)
         else:
             log.warning(
-                "Не удалось найти .env — POSITION_MINT не сохранён (%s). "
-                "После рестарта бот не увидит эту позицию.",
+                "Не удалось найти .env файл на диске (ожидаемо в Docker) — "
+                "POSITION_MINT сохранён только в памяти процесса, не в файле: %s",
                 new_mint_str,
             )
 

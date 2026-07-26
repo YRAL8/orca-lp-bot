@@ -3,6 +3,13 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env
+    # .env смонтирован файлом (не только env_file) — без этого find_dotenv() внутри
+    # контейнера всегда возвращает пусто (env_file передаёт значения как переменные
+    # окружения процесса, не кладёт сам файл на диск), и код, который пишет
+    # POSITION_MINT обратно в .env при реальном open/close_position(), не может
+    # найти файл для записи (поймано вживую на сервере, 2026-07-26).
+    volumes:
+      - ./.env:/app/.env
     logging:
       driver: json-file
       options:
