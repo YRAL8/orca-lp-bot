@@ -519,8 +519,28 @@ async def close_position(position: Position) -> bool:
 
 
 async def open_position(current_price: float) -> Optional[Position]:
-    lower = current_price * (1 - config.RANGE_WIDTH_PCT / 100)
-    upper = current_price * (1 + config.RANGE_WIDTH_PCT / 100)
+    async with get_client() as client:
+        ctx = await _get_context(client)
+        whirlpool = await _load_whirlpool(ctx)
+        _, dec_a, dec_b, _, _ = await _pool_price_and_decimals(ctx, whirlpool)
+
+    raw_lower = current_price * (1 - config.RANGE_WIDTH_PCT / 100)
+    raw_upper = current_price * (1 + config.RANGE_WIDTH_PCT / 100)
+    tick_lower = _price_to_tick(raw_lower, dec_a, dec_b, whirlpool.tick_spacing)
+    tick_upper = _price_to_tick(raw_upper, dec_a, dec_b, whirlpool.tick_spacing)
+    # Align range with initializable ticks (rounding can be asymmetric).
+    lower = float(
+        DecimalUtil.to_fixed(
+            PriceMath.tick_index_to_price(tick_lower, dec_a, dec_b),
+            dec_b,
+        )
+    )
+    upper = float(
+        DecimalUtil.to_fixed(
+            PriceMath.tick_index_to_price(tick_upper, dec_a, dec_b),
+            dec_b,
+        )
+    )
 
     if DRY_RUN:
         log.info(
