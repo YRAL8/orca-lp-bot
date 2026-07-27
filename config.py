@@ -13,12 +13,6 @@ WALLET_PRIVATE_KEY = os.getenv("WALLET_PRIVATE_KEY", "").strip()
 WHIRLPOOL_ADDRESS = os.getenv("WHIRLPOOL_ADDRESS", "").strip()
 POSITION_MINT = os.getenv("POSITION_MINT", "").strip()
 
-# Единственный адрес назначения для /withdraw — задаётся один раз тут, НЕ принимается
-# как аргумент команды в Telegram. Так /withdraw физически не может отправить деньги
-# куда-то ещё, кроме заранее проверенного пользователем адреса (опечатка в команде или
-# компрометация Telegram-аккаунта не может увести средства на чужой адрес).
-WITHDRAWAL_ADDRESS = os.getenv("WITHDRAWAL_ADDRESS", "").strip()
-
 # Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()

@@ -8,10 +8,6 @@ WALLET_PRIVATE_KEY=YOUR_PRIVATE_KEY_BASE58
 WHIRLPOOL_ADDRESS=HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ
 POSITION_MINT=YOUR_POSITION_NFT_MINT
 
-# Единственный адрес назначения для команды /withdraw (полный вывод SOL+USDC из
-# кошелька бота). Не аргумент команды — задаётся только здесь.
-WITHDRAWAL_ADDRESS=YOUR_WITHDRAWAL_WALLET_ADDRESS
-
 # Telegram
 TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN
 TELEGRAM_CHAT_ID=YOUR_CHAT_ID

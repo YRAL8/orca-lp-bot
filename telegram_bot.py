@@ -815,61 +815,63 @@ async def boevoy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /withdraw — полный вывод SOL+USDC из кошелька бота на WITHDRAWAL_ADDRESS (адрес
-    задан только в .env, НЕ аргументом команды — так команду физически нельзя
-    отправить куда-то ещё). Двухшаговое подтверждение через отдельный аргумент
-    "confirm", а не через сохранённое между сообщениями состояние — так надёжнее:
-    /withdraw confirm либо срабатывает по своим собственным свежим данным, либо нет,
-    без риска зависшего "ожидания подтверждения" от предыдущего сообщения.
+    /withdraw — закрывает открытую позицию на Orca. Никуда деньги отдельно не
+    переводит: кошелёк бота уже принадлежит владельцу (приватный ключ у него в
+    .env), так что после закрытия позиции средства просто оказываются в кошельке —
+    отдельный перевод на внешний адрес не нужен (более ранняя версия команды делала
+    ещё и такой перевод, владелец явно попросил убрать это как бессмысленное).
 
-    Намеренно НЕ проверяет main.bot_frozen и main._rebalance_lock — это единственная
-    команда, которая должна работать даже при /stop (аварийный выход должен быть
-    доступен именно тогда, когда всё остальное остановлено, а не наоборот).
+    Двухшаговое подтверждение через отдельный аргумент "confirm", а не через
+    сохранённое между сообщениями состояние — /withdraw confirm всегда читает
+    свежие данные заново, без риска зависшего "ожидания" от предыдущего сообщения.
+
+    Берёт main._rebalance_lock на время закрытия (не гонять close_position
+    параллельно с автоматическим/ручным ребалансом той же позиции), но намеренно НЕ
+    проверяет main.bot_frozen — эта команда должна работать даже при /stop
+    (аварийный выход нужен именно тогда, когда всё остальное остановлено).
     """
-    import config
-    from orca import withdraw_all
-    from solana_client import get_sol_balance, get_usdc_balance
-
-    if config.is_placeholder(config.WITHDRAWAL_ADDRESS):
-        await _reply(
-            update,
-            context,
-            "❌ WITHDRAWAL_ADDRESS не задан в .env — сначала укажи адрес назначения там.",
-        )
-        return
+    import main
+    from orca import get_position, close_position
 
     confirmed = bool(context.args) and context.args[0].lower() == "confirm"
 
+    try:
+        position = await get_position()
+    except Exception as e:
+        await _reply(update, context, f"❌ Не удалось загрузить позицию: {e!r}")
+        return
+
+    if position is None or position.is_demo:
+        await _reply(update, context, "❌ Открытой реальной позиции нет — закрывать нечего.")
+        return
+
     if not confirmed:
-        sol_balance = await get_sol_balance()
-        usdc_balance = await get_usdc_balance()
-        sol_line = f"{sol_balance:.4f}" if sol_balance is not None else "?"
-        usdc_line = f"{usdc_balance:.2f}" if usdc_balance is not None else "?"
         await _reply(
             update,
             context,
-            f"⚠️ <b>Вывести ВСЁ на:</b>\n<code>{config.WITHDRAWAL_ADDRESS}</code>\n\n"
-            f"SOL: {sol_line}\nUSDC: {usdc_line}\n\n"
-            f"Открытая позиция (если есть) НЕ закрывается — выводится только то, что "
-            f"уже в кошельке.\nПодтвердить: /withdraw confirm",
+            f"⚠️ <b>Закрыть позицию:</b> ${position.total_value_usd:.2f}\n"
+            f"Диапазон: ${position.lower_price:.2f}–${position.upper_price:.2f}\n\n"
+            f"Деньги останутся в кошельке бота — никуда отдельно не переводятся.\n"
+            f"Подтвердить: /withdraw confirm",
             parse_mode="HTML",
         )
         return
 
-    await _reply(update, context, "💸 Вывожу...")
-    try:
-        result = await withdraw_all(config.WITHDRAWAL_ADDRESS)
-        await _reply(
-            update,
-            context,
-            f"✅ <b>Выведено</b>\n"
-            f"SOL: {result['sol_sent']:.4f}\nUSDC: {result['usdc_sent']:.2f}\n"
-            f"tx: <code>{result['signature']}</code>",
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        log.exception("Ошибка при /withdraw: %s", e)
-        await _reply(update, context, f"❌ Ошибка: {e!r}")
+    async with main._rebalance_lock:
+        try:
+            await _reply(update, context, "🔒 Закрываю позицию...")
+            closed = await close_position(position)
+            if not closed:
+                await _reply(update, context, "❌ Не удалось закрыть позицию.")
+                return
+            await _reply(
+                update,
+                context,
+                "✅ Позиция закрыта — средства теперь в кошельке бота.",
+            )
+        except Exception as e:
+            log.exception("Ошибка при /withdraw: %s", e)
+            await _reply(update, context, f"❌ Ошибка: {e!r}")
 
 
 # Список для кнопки "Меню" в Telegram (иконка рядом с полем ввода) — штатная функция
@@ -886,7 +888,7 @@ _MENU_COMMANDS = [
     BotCommand("pauza", "Пауза автоматики"),
     BotCommand("stop", "Полная заморозка"),
     BotCommand("boevoy", "Вернуть в боевой режим"),
-    BotCommand("withdraw", "Вывести всё из кошелька (нужно подтверждение)"),
+    BotCommand("withdraw", "Закрыть позицию (нужно подтверждение)"),
 ]
 
 
