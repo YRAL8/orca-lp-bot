@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import logging.handlers
 from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -13,12 +14,17 @@ from config import (
     TELEGRAM_BOT_TOKEN, is_placeholder,
 )
 
-# Настройка логов
+# Настройка логов. RotatingFileHandler вместо простого FileHandler — тот рос без
+# ограничения (найдено при аудите Opus 4.8, 2026-07-26): при постоянно работающем
+# в контейнере боте bot.log мог расти бесконечно. 5 МБ x 5 файлов — с запасом на
+# месяцы обычной работы (тик мониторинга раз в 5 минут даёт ~10 КБ/час).
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler("bot.log"),
+        logging.handlers.RotatingFileHandler(
+            "bot.log", maxBytes=5 * 1024 * 1024, backupCount=5
+        ),
         logging.StreamHandler()
     ]
 )
