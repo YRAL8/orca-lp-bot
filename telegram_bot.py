@@ -444,13 +444,35 @@ async def setrange_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         current_position = position
 
+        if position.is_demo:
+            # Демо-диапазон (_demo_range) уже пересчитан на новый pct внутри
+            # get_position(), так что lower_price/upper_price — это и есть новый диапазон.
+            range_block = (
+                f"   Нижняя: ${position.lower_price:.2f}\n"
+                f"   Верхняя: ${position.upper_price:.2f}\n"
+            )
+        else:
+            # РЕАЛЬНУЮ открытую позицию /setrange не двигает — её on-chain диапазон
+            # не изменится до следующего /rebalance или /open. Раньше здесь тоже
+            # печатались position.lower_price/upper_price, то есть СТАРЫЙ, никак не
+            # связанный с новым pct диапазон, подписанный как будто это и есть новый
+            # "Диапазон обновлён" — реально вводило в заблуждение, поймано вживую
+            # 2026-07-27 (/setrange 2 показал прежние ±8%-границы).
+            preview_lower = position.current_price * (1 - pct / 100)
+            preview_upper = position.current_price * (1 + pct / 100)
+            range_block = (
+                f"Текущая открытая позиция НЕ меняется: "
+                f"${position.lower_price:.2f}–${position.upper_price:.2f}\n"
+                f"Ориентировочно при следующем /rebalance или /open: "
+                f"~${preview_lower:.2f}–${preview_upper:.2f}\n"
+            )
+
         await _reply(
             update,
             context,
-            f"✅ <b>Диапазон обновлён: ±{pct}%</b>\n"
+            f"✅ <b>RANGE_WIDTH_PCT = ±{pct}%</b>\n"
             f"📈 Цена SOL: ${position.current_price:.2f}\n"
-            f"   Нижняя: ${position.lower_price:.2f}\n"
-            f"   Верхняя: ${position.upper_price:.2f}\n"
+            f"{range_block}"
             f"Изменение действует до перезапуска бота — в .env остаётся прежнее значение по умолчанию.",
             parse_mode="HTML",
         )
