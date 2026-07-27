@@ -13,7 +13,7 @@ from config import (
     REBALANCE_DELAY_MIN,
     is_placeholder,
 )
-from solana_client import get_sol_balance
+from solana_client import get_sol_balance, get_usdc_balance
 
 log = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ price_history: deque[float] = deque(maxlen=12)
 _bot: Bot | None = None
 
 # Команды, доступные только владельцу (TELEGRAM_CHAT_ID).
-_OWNER_COMMANDS = ("status", "setrange", "rebalance")
+_OWNER_COMMANDS = ("status", "setrange", "rebalance", "addliquidity")
 
 
 def _owner_chat_id() -> int | None:
@@ -190,6 +190,22 @@ async def notify_rpc_down(ticks: int) -> None:
     await send_message(
         f"❌ <b>RPC недоступен</b>\n"
         f"Мониторинг не работает уже {ticks} тиков подряд."
+    )
+
+
+async def notify_position_lost(mint: str) -> None:
+    """
+    Уведомление о том, что get_position() не смог найти позицию on-chain для
+    настроенного POSITION_MINT — раньше это молча логировалось и мониторинг
+    выходил без единого алерта (найдено независимым аудитом, Opus 4.8,
+    2026-07-27): heartbeat при этом продолжал слать последнюю УСПЕШНУЮ позицию
+    как актуальную, маскируя реальную проблему под "всё в порядке".
+    """
+    await send_message(
+        f"❌ <b>Позиция не найдена on-chain</b>\n"
+        f"mint: <code>{mint}</code>\n"
+        f"Проверь POSITION_MINT в .env и реальное состояние позиции вручную — "
+        f"мониторинг и heartbeat приостановлены, пока это не разрешится."
     )
 
 
@@ -494,6 +510,125 @@ async def rebalance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await notify_rebalance_error(str(e))
 
 
+async def addliquidity_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Обработчик /addliquidity <сумма USDC> — доливает ликвидность В ТЕКУЩУЮ открытую
+    позицию (increase_liquidity на её существующий диапазон), без close/reopen. Сумму
+    выбирает владелец каждый раз явно; бот только проверяет баланс/состояние позиции
+    перед отправкой, ничего не решает и не лимитирует сам.
+    """
+    global current_position
+
+    import config
+    from orca import get_position, add_liquidity, estimate_add_liquidity_sol_needed
+
+    # Тот же лок, что и у /rebalance и автоматического ребаланса — доливка во время
+    # close/reopen целилась бы в position_pda, которого в этот момент может уже не быть
+    # (или ещё не быть) on-chain.
+    import main
+
+    if main._rebalance_lock.locked():
+        await _reply(update, context, "⏳ Идёт ребаланс — подожди, потом долей.")
+        return
+
+    if not context.args:
+        await _reply(
+            update,
+            context,
+            "Использование: /addliquidity &lt;сумма USDC&gt;\nПример: /addliquidity 5",
+            parse_mode="HTML",
+        )
+        return
+
+    try:
+        usdc_amount = float(context.args[0])
+    except ValueError:
+        await _reply(update, context, "❌ Нужно число, например: /addliquidity 5")
+        return
+
+    if usdc_amount <= 0:
+        await _reply(update, context, "❌ Сумма должна быть больше 0.")
+        return
+
+    async with main._rebalance_lock:
+        try:
+            position = await get_position()
+        except Exception as e:
+            await _reply(update, context, f"❌ Не удалось загрузить позицию: {e}")
+            return
+
+        if position is None:
+            await _reply(update, context, "❌ Нет открытой позиции для доливки.")
+            return
+        if position.is_demo:
+            await _reply(
+                update,
+                context,
+                "❌ Сейчас активна демо-позиция (POSITION_MINT не задан) — доливать некуда.",
+            )
+            return
+
+        usdc_balance = await get_usdc_balance()
+        sol_balance = await get_sol_balance()
+        if usdc_balance is not None and usdc_amount > usdc_balance:
+            await _reply(
+                update,
+                context,
+                f"❌ Запрошено ${usdc_amount:.2f} USDC, на кошельке только ${usdc_balance:.2f} USDC.",
+            )
+            return
+        # Точный расчёт вместо грубого "sol_balance <= MIN_SOL_BALANCE": та проверка
+        # блокировала даже доливки, которым SOL вообще не нужен (позиция вне
+        # диапазона, вход целиком в USDC), и пропускала пограничные случаи, где
+        # реально нужная сумма SOL всё равно не влезала в остаток после резерва —
+        # транзакция ушла бы в сеть и упала on-chain, впустую сжигая газ (найдено
+        # независимым аудитом, GPT-5.2, 2026-07-27).
+        try:
+            required_sol = await estimate_add_liquidity_sol_needed(position, usdc_amount)
+        except Exception as e:
+            await _reply(update, context, f"❌ Не удалось оценить нужный SOL: {e}")
+            return
+
+        if sol_balance is not None:
+            usable_sol = sol_balance - config.MIN_SOL_BALANCE
+            if required_sol > usable_sol:
+                await _reply(
+                    update,
+                    context,
+                    f"❌ Для доливки ${usdc_amount:.2f} USDC нужно ещё ~{required_sol:.4f} SOL "
+                    f"второй ногой, а свободно (за вычетом MIN_SOL_BALANCE="
+                    f"{config.MIN_SOL_BALANCE}) только {usable_sol:.4f} SOL. "
+                    "Пополни кошелёк или уменьши сумму.",
+                )
+                return
+
+        warn = (
+            ""
+            if position.in_range
+            else "⚠️ Позиция сейчас ВНЕ диапазона — доливка ляжет в основном в один токен.\n"
+        )
+        await _reply(update, context, f"{warn}💧 Доливаю ${usdc_amount:.2f} USDC в текущую позицию...")
+
+        try:
+            new_position = await add_liquidity(position, usdc_amount)
+            if new_position:
+                current_position = new_position
+                await _reply(
+                    update,
+                    context,
+                    f"✅ <b>Ликвидность добавлена</b>\n"
+                    f"💰 Позиция: ${new_position.total_value_usd:.2f} "
+                    f"(SOL ${new_position.value_sol_usd:.2f} + USDC ${new_position.value_usdc_usd:.2f})\n"
+                    f"Диапазон: ${new_position.lower_price:.2f}–${new_position.upper_price:.2f}",
+                    parse_mode="HTML",
+                )
+            else:
+                await _reply(update, context, "❌ Не удалось подтвердить доливку.")
+        except Exception as e:
+            log.exception("Ошибка при /addliquidity: %s", e)
+            await _reply(update, context, f"❌ Ошибка: {e}")
+
+
 def build_telegram_app() -> Application:
     """Создаёт и настраивает Telegram приложение с командами."""
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -510,6 +645,7 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("status", status_command, filters=owner_chat))
     app.add_handler(CommandHandler("setrange", setrange_command, filters=owner_chat))
     app.add_handler(CommandHandler("rebalance", rebalance_command, filters=owner_chat))
+    app.add_handler(CommandHandler("addliquidity", addliquidity_command, filters=owner_chat))
     # Чужие чаты: только warning в лог, без ответа (не светим, что бот живой).
     app.add_handler(
         CommandHandler(

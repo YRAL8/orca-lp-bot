@@ -1369,6 +1369,268 @@ async def open_position(current_price: float, usdc_amount: Optional[float] = Non
         return position
 
 
+async def estimate_add_liquidity_sol_needed(position: Position, usdc_amount: float) -> float:
+    """
+    Сколько SOL реально потребует add_liquidity(position, usdc_amount) второй ногой
+    депозита — read-only оценка тем же quote (те же tick-диапазон и slippage 1%,
+    что и в самой add_liquidity()), без кошелька и без отправки чего-либо.
+
+    Раньше /addliquidity проверял только грубое "sol_balance <= MIN_SOL_BALANCE",
+    без расчёта, сколько SOL реально нужно под конкретную сумму — на пограничном
+    балансе транзакция могла упасть on-chain уже после отправки, впустую сжигая
+    комиссию; и наоборот, блокировала доливку даже когда позиция вне диапазона и
+    SOL-нога вообще не нужна (найдено независимым аудитом, GPT-5.2, 2026-07-27).
+    """
+    if usdc_amount <= 0:
+        raise ValueError("Сумма USDC для доливки должна быть > 0")
+    if position.is_demo:
+        raise ValueError("Сейчас демо-позиция (POSITION_MINT не задан) — доливать некуда")
+
+    async with get_client() as client:
+        ctx = await _get_context(client)
+        whirlpool = await _load_whirlpool(ctx)
+        _, dec_a, dec_b, _, _ = await _pool_price_and_decimals(ctx, whirlpool)
+
+        position_mint = Pubkey.from_string(position.mint)
+        position_pda = PDAUtil.get_position(ORCA_WHIRLPOOL_PROGRAM_ID, position_mint)
+        on_chain = await ctx.fetcher.get_position(position_pda.pubkey)
+        if on_chain is None:
+            raise ValueError(f"Позиция не найдена on-chain для mint {position.mint}")
+
+        tick_lower = on_chain.tick_lower_index
+        tick_upper = on_chain.tick_upper_index
+
+        usdc_mint = Pubkey.from_string(USDC_MINT)
+        if whirlpool.token_mint_a == usdc_mint:
+            usdc_decimals = dec_a
+        elif whirlpool.token_mint_b == usdc_mint:
+            usdc_decimals = dec_b
+        else:
+            raise ValueError("Whirlpool не содержит USDC mint, доливка невозможна")
+
+        input_amount_usdc = round(usdc_amount * 10**usdc_decimals)
+        quote = QuoteBuilder.increase_liquidity_by_input_token(
+            IncreaseLiquidityQuoteParams(
+                input_token_amount=input_amount_usdc,
+                input_token_mint=usdc_mint,
+                token_mint_a=whirlpool.token_mint_a,
+                token_mint_b=whirlpool.token_mint_b,
+                tick_current_index=whirlpool.tick_current_index,
+                sqrt_price=whirlpool.sqrt_price,
+                tick_lower_index=tick_lower,
+                tick_upper_index=tick_upper,
+                slippage_tolerance=Percentage.from_fraction(1, 100),
+            )
+        )
+
+        if quote.liquidity <= 0:
+            raise ValueError(
+                f"Расчётная ликвидность равна нулю (диапазон ${position.lower_price:.4f}-"
+                f"${position.upper_price:.4f} не покрывает текущую цену пула) — доливка отменена"
+            )
+
+        sol_mint = Pubkey.from_string(SOL_MINT)
+        if whirlpool.token_mint_a == sol_mint:
+            wrapped_sol_lamports = quote.token_max_a
+        elif whirlpool.token_mint_b == sol_mint:
+            wrapped_sol_lamports = quote.token_max_b
+        else:
+            raise ValueError("Whirlpool не содержит SOL mint, доливка невозможна")
+
+        return wrapped_sol_lamports / 1_000_000_000
+
+
+async def add_liquidity(position: Position, usdc_amount: float) -> Optional[Position]:
+    """
+    Доливает ликвидность в УЖЕ открытую позицию (increase_liquidity на её существующий
+    диапазон) — в отличие от rebalance(), НЕ закрывает и не открывает позицию заново.
+    usdc_amount задаёт входную сумму в USDC; вторая нога (SOL) добавляется автоматически
+    в пропорции, которую требует текущая цена и диапазон — как и в open_position().
+    """
+    if usdc_amount <= 0:
+        raise ValueError("Сумма USDC для доливки должна быть > 0")
+    if position.is_demo:
+        raise ValueError("Сейчас демо-позиция (POSITION_MINT не задан) — доливать некуда")
+
+    async with get_client() as client:
+        ctx = await _get_context(client)
+        whirlpool = await _load_whirlpool(ctx)
+        _, dec_a, dec_b, _, _ = await _pool_price_and_decimals(ctx, whirlpool)
+
+        # position.mint, а не глобальный POSITION_MINT — тот же паттерн, что в
+        # close_position()/collect_fees(). Доливаем ровно в ту позицию, которую
+        # передал вызывающий код, а не в ту, что сейчас считается "активной"
+        # глобально (найдено независимым аудитом, GPT-5.2, 2026-07-27).
+        position_mint = Pubkey.from_string(position.mint)
+        position_pda = PDAUtil.get_position(ORCA_WHIRLPOOL_PROGRAM_ID, position_mint)
+        on_chain = await ctx.fetcher.get_position(position_pda.pubkey)
+        if on_chain is None:
+            raise ValueError(f"Позиция не найдена on-chain для mint {position.mint}")
+
+        # Диапазон берём с существующей on-chain позиции, а не пересчитываем из
+        # RANGE_WIDTH_PCT — доливка идёт в уже открытый диапазон, а не в новый.
+        tick_lower = on_chain.tick_lower_index
+        tick_upper = on_chain.tick_upper_index
+
+        usdc_mint = Pubkey.from_string(USDC_MINT)
+        if whirlpool.token_mint_a == usdc_mint:
+            usdc_decimals = dec_a
+        elif whirlpool.token_mint_b == usdc_mint:
+            usdc_decimals = dec_b
+        else:
+            raise ValueError("Whirlpool не содержит USDC mint, доливка невозможна")
+
+        if DRY_RUN:
+            log.info(
+                "DRY RUN: add_liquidity — %.6f USDC в существующий диапазон $%.4f-$%.4f",
+                usdc_amount,
+                position.lower_price,
+                position.upper_price,
+            )
+            return position
+
+        wallet = get_wallet_keypair()
+        wallet_pubkey = wallet.pubkey()
+        whirlpool_pubkey = Pubkey.from_string(WHIRLPOOL_ADDRESS)
+        real_slippage = Percentage.from_fraction(1, 100)
+
+        # round(), не int() — та же причина, что в open_position() (float*10**decimals
+        # может дать 1999999.9999... для "ровных" сумм).
+        input_amount_usdc = round(usdc_amount * 10**usdc_decimals)
+        quote = QuoteBuilder.increase_liquidity_by_input_token(
+            IncreaseLiquidityQuoteParams(
+                input_token_amount=input_amount_usdc,
+                input_token_mint=usdc_mint,
+                token_mint_a=whirlpool.token_mint_a,
+                token_mint_b=whirlpool.token_mint_b,
+                tick_current_index=whirlpool.tick_current_index,
+                sqrt_price=whirlpool.sqrt_price,
+                tick_lower_index=tick_lower,
+                tick_upper_index=tick_upper,
+                slippage_tolerance=real_slippage,
+            )
+        )
+
+        if quote.liquidity <= 0:
+            raise ValueError(
+                f"Расчётная ликвидность равна нулю (диапазон ${position.lower_price:.4f}-"
+                f"${position.upper_price:.4f} не покрывает текущую цену пула) — доливка отменена"
+            )
+
+        token_max_a = quote.token_max_a
+        token_max_b = quote.token_max_b
+
+        sol_mint = Pubkey.from_string(SOL_MINT)
+        if whirlpool.token_mint_a == sol_mint:
+            wrapped_sol_lamports = token_max_a
+        elif whirlpool.token_mint_b == sol_mint:
+            wrapped_sol_lamports = token_max_b
+        else:
+            raise ValueError("Whirlpool не содержит SOL mint, wrapped SOL счёт не может быть создан")
+
+        # ATA обеих сторон уже должны существовать (позиция открыта) — idempotent-запрос
+        # тут просто найдёт их, а не создаст заново, лишней ренты не будет.
+        token_owner_a = await TokenUtil.resolve_or_create_ata(
+            client,
+            wallet_pubkey,
+            whirlpool.token_mint_a,
+            wrapped_sol_amount=wrapped_sol_lamports if whirlpool.token_mint_a == sol_mint else 0,
+            funder=wallet_pubkey,
+            idempotent=True,
+        )
+        token_owner_b = await TokenUtil.resolve_or_create_ata(
+            client,
+            wallet_pubkey,
+            whirlpool.token_mint_b,
+            wrapped_sol_amount=wrapped_sol_lamports if whirlpool.token_mint_b == sol_mint else 0,
+            funder=wallet_pubkey,
+            idempotent=True,
+        )
+
+        position_token_account = TokenUtil.derive_ata(wallet_pubkey, position_mint)
+
+        # Тик-массивы для этого диапазона уже инициализированы (позиция в нём открыта) —
+        # в отличие от open_position(), initialize_tick_array здесь не нужен.
+        lower_start_tick = TickUtil.get_start_tick_index(tick_lower, whirlpool.tick_spacing)
+        upper_start_tick = TickUtil.get_start_tick_index(tick_upper, whirlpool.tick_spacing)
+        tick_array_lower_pda = PDAUtil.get_tick_array(
+            ORCA_WHIRLPOOL_PROGRAM_ID, whirlpool_pubkey, lower_start_tick
+        )
+        tick_array_upper_pda = PDAUtil.get_tick_array(
+            ORCA_WHIRLPOOL_PROGRAM_ID, whirlpool_pubkey, upper_start_tick
+        )
+
+        increase_liquidity_ix = WhirlpoolIx.increase_liquidity(
+            ORCA_WHIRLPOOL_PROGRAM_ID,
+            IncreaseLiquidityParams(
+                liquidity_amount=quote.liquidity,
+                token_max_a=token_max_a,
+                token_max_b=token_max_b,
+                whirlpool=whirlpool_pubkey,
+                position_authority=wallet_pubkey,
+                position=position_pda.pubkey,
+                position_token_account=position_token_account,
+                token_owner_account_a=token_owner_a.pubkey,
+                token_owner_account_b=token_owner_b.pubkey,
+                token_vault_a=whirlpool.token_vault_a,
+                token_vault_b=whirlpool.token_vault_b,
+                tick_array_lower=tick_array_lower_pda.pubkey,
+                tick_array_upper=tick_array_upper_pda.pubkey,
+            ),
+        )
+
+        tx_builder = TransactionBuilder(client, wallet)
+        tx_builder.set_compute_unit_limit(400_000)
+        tx_builder.set_compute_unit_price(config.PRIORITY_FEE_MICROLAMPORTS)
+        tx_builder.add_instruction(token_owner_a.instruction)
+        tx_builder.add_instruction(token_owner_b.instruction)
+        tx_builder.add_instruction(increase_liquidity_ix)
+
+        log.info(
+            "Prepared REAL add_liquidity tx (not sent): mint=%s range=$%.4f-$%.4f "
+            "input_usdc=%.6f (%d units) liquidity=%d",
+            position.mint,
+            position.lower_price,
+            position.upper_price,
+            usdc_amount,
+            input_amount_usdc,
+            quote.liquidity,
+        )
+
+        signature = await tx_builder.build_and_execute()
+        # Тот же двойной чек, что и во всех остальных реальных транзакциях этого модуля:
+        # confirm_transaction() проверяет только confirmation_status, не err.
+        status_resp = await _get_signature_status_with_retry(client, signature)
+        status = status_resp.value[0]
+        if status is None or status.err is not None:
+            raise RuntimeError(
+                f"Транзакция add_liquidity не удалась on-chain: signature={signature} "
+                f"err={status.err if status else 'нет статуса'}"
+            )
+        log.info("add_liquidity успешно отправлена и подтверждена: %s", signature)
+
+        # Синхронизируем глобальный POSITION_MINT с position.mint (тот же паттерн,
+        # что в open_position()) — обычно уже совпадает, но если вызывающий код
+        # держал не самый свежий Position, доливка сама по себе явное решение
+        # оператора считать position.mint активной позицией, так что self-heal
+        # здесь корректен, а не просто noop.
+        global POSITION_MINT
+        POSITION_MINT = position.mint
+        config.POSITION_MINT = position.mint
+
+        dotenv_path = find_dotenv()
+        if dotenv_path:
+            set_key(dotenv_path, "POSITION_MINT", position.mint, quote_mode="never")
+        else:
+            log.warning(
+                "Не удалось найти .env файл на диске (ожидаемо в Docker) — "
+                "POSITION_MINT сохранён только в памяти процесса, не в файле: %s",
+                position.mint,
+            )
+
+    return await get_position()
+
+
 async def rebalance(position: Position) -> Optional[Position]:
     log.info("Начинаем ребаланс%s...", " [DRY RUN]" if DRY_RUN else "")
 

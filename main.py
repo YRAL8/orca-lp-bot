@@ -3,6 +3,7 @@ import logging
 from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+import config
 import telegram_bot as tg
 from orca import get_position, rebalance, get_current_price
 from solana_client import get_sol_balance
@@ -51,6 +52,10 @@ stale_alert_sent = False
 # пока баланс не вернётся выше MIN_SOL_BALANCE.
 low_sol_alert_sent = False
 
+# Уже отправили алерт "позиция не найдена on-chain"? Чтобы не повторять
+# каждые POLL_INTERVAL_SEC, пока позиция не найдётся снова.
+position_lost_alert_sent = False
+
 # Порог подряд идущих ошибок тиков мониторинга для алерта о недоступности RPC.
 RPC_DOWN_ALERT_THRESHOLD_TICKS = 3
 
@@ -73,7 +78,7 @@ async def monitor_position() -> None:
     Основной цикл мониторинга.
     Запускается каждые POLL_INTERVAL_SEC секунд.
     """
-    global out_of_range_since, stale_alert_sent, low_sol_alert_sent, rpc_error_streak, rpc_down_alert_sent
+    global out_of_range_since, stale_alert_sent, low_sol_alert_sent, rpc_error_streak, rpc_down_alert_sent, position_lost_alert_sent
 
     # Если уже идёт ребаланс — пропускаем. Проверка + вход в lock ниже идут без await
     # между ними, так что в однопоточном asyncio-цикле это безопасно (в отличие от
@@ -99,8 +104,27 @@ async def monitor_position() -> None:
         position = await get_position()
         if position is None:
             log.error("Не удалось получить позицию")
+            # Раньше здесь не было алерта вообще — мониторинг тихо выходил, а
+            # heartbeat каждые HEARTBEAT_INTERVAL_HOURS продолжал слать
+            # последнюю УСПЕШНУЮ позицию как актуальную (tg.current_position
+            # не обнулялся), маскируя реальную проблему под "всё в порядке"
+            # (найдено независимым аудитом, Opus 4.8, 2026-07-27). Теперь явно
+            # алертим один раз и глушим heartbeat, пока позиция не найдётся снова.
+            if not position_lost_alert_sent:
+                try:
+                    # config.POSITION_MINT (атрибут модуля), не from-import — иначе
+                    # значение зафиксировалось бы на момент импорта и не видело бы
+                    # обновлений, которые orca.py делает в рантайме через
+                    # `config.POSITION_MINT = ...` (тот же класс бага, что уже был
+                    # найден с локальными re-import'ами в setrange_command).
+                    await tg.notify_position_lost(config.POSITION_MINT)
+                    position_lost_alert_sent = True
+                except Exception as notify_error:
+                    log.exception("Не удалось отправить alert о потере позиции: %s", notify_error)
+            tg.current_position = None
             _reset_rpc_error_state()
             return
+        position_lost_alert_sent = False
 
         # Обновляем глобальную позицию для /status
         tg.current_position = position
