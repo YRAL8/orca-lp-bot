@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from collections import deque
-from telegram import Update, Bot
+from telegram import BotCommand, Update, Bot
 from telegram.ext import Application, CommandHandler, ContextTypes, filters
 from config import (
     TELEGRAM_BOT_TOKEN,
@@ -810,6 +810,28 @@ async def boevoy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context,
         "⚔️ Боевой режим — автоматика и все ручные команды снова работают.",
     )
+
+
+# Список для кнопки "Меню" в Telegram (иконка рядом с полем ввода) — штатная функция
+# клиента, не кастомная клавиатура. Нажатие на пункт сразу отправляет команду как
+# есть, без аргумента — для /setrange, /addliquidity, /open дальше как обычно нужно
+# дописать число вручную (это меню только напоминает список и точное написание
+# команд, а не собирает аргументы).
+_MENU_COMMANDS = [
+    BotCommand("status", "Статус позиции и баланс"),
+    BotCommand("rebalance", "Ребаланс прямо сейчас"),
+    BotCommand("addliquidity", "Долить ликвидность (нужна сумма)"),
+    BotCommand("open", "Открыть новую позицию (нужна сумма)"),
+    BotCommand("setrange", "Изменить ширину диапазона (нужен %)"),
+    BotCommand("pauza", "Пауза автоматики"),
+    BotCommand("stop", "Полная заморозка"),
+    BotCommand("boevoy", "Вернуть в боевой режим"),
+]
+
+
+async def register_menu_commands(app: Application) -> None:
+    """Регистрирует список команд для кнопки "Меню" в Telegram-клиенте."""
+    await app.bot.set_my_commands(_MENU_COMMANDS)
 
 
 def build_telegram_app() -> Application:

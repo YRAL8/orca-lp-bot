@@ -334,6 +334,10 @@ async def main() -> None:
             try:
                 async with app:
                     await app.start()
+                    try:
+                        await tg.register_menu_commands(app)
+                    except Exception as e:
+                        log.exception("Не удалось зарегистрировать меню команд: %s", e)
                     await app.updater.start_polling()
                     telegram_polling_started = True
                     log.info("Telegram бот запущен, команда /status активна")
