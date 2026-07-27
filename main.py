@@ -65,6 +65,12 @@ rpc_error_streak = 0
 # Анти-спам: уже отправляли алерт "RPC недоступен" для текущей серии ошибок?
 rpc_down_alert_sent = False
 
+# /pauza — авто-цикл (monitor_position) стоит, ручные команды (/rebalance,
+# /addliquidity) по-прежнему работают. /stop — полная заморозка, ручные команды
+# денежных действий тоже отключены. /boevoy снимает оба разом.
+bot_paused = False
+bot_frozen = False
+
 
 def _reset_rpc_error_state() -> None:
     """Сбрасывает состояние RPC-ошибок после успешного тика мониторинга."""
@@ -79,6 +85,10 @@ async def monitor_position() -> None:
     Запускается каждые POLL_INTERVAL_SEC секунд.
     """
     global out_of_range_since, stale_alert_sent, low_sol_alert_sent, rpc_error_streak, rpc_down_alert_sent, position_lost_alert_sent
+
+    if bot_paused or bot_frozen:
+        log.info("Бот на паузе/заморожен (/pauza, /stop) — пропускаем тик мониторинга")
+        return
 
     # Если уже идёт ребаланс — пропускаем. Проверка + вход в lock ниже идут без await
     # между ними, так что в однопоточном asyncio-цикле это безопасно (в отличие от

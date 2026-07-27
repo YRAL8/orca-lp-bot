@@ -27,7 +27,9 @@ price_history: deque[float] = deque(maxlen=12)
 _bot: Bot | None = None
 
 # Команды, доступные только владельцу (TELEGRAM_CHAT_ID).
-_OWNER_COMMANDS = ("status", "setrange", "rebalance", "addliquidity")
+_OWNER_COMMANDS = (
+    "status", "setrange", "rebalance", "addliquidity", "pauza", "stop", "boevoy",
+)
 
 
 def _owner_chat_id() -> int | None:
@@ -480,6 +482,10 @@ async def rebalance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     import main
     from orca import get_position, rebalance
 
+    if main.bot_frozen:
+        await _reply(update, context, "🛑 Бот заморожен (/stop) — сначала /boevoy.")
+        return
+
     if main._rebalance_lock.locked():
         await _reply(update, context, "⏳ Ребаланс уже выполняется — подожди.")
         return
@@ -526,6 +532,10 @@ async def addliquidity_command(update: Update, context: ContextTypes.DEFAULT_TYP
     # close/reopen целилась бы в position_pda, которого в этот момент может уже не быть
     # (или ещё не быть) on-chain.
     import main
+
+    if main.bot_frozen:
+        await _reply(update, context, "🛑 Бот заморожен (/stop) — сначала /boevoy.")
+        return
 
     if main._rebalance_lock.locked():
         await _reply(update, context, "⏳ Идёт ребаланс — подожди, потом долей.")
@@ -629,6 +639,47 @@ async def addliquidity_command(update: Update, context: ContextTypes.DEFAULT_TYP
             await _reply(update, context, f"❌ Ошибка: {e}")
 
 
+async def pauza_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/pauza — останавливает только автоматический цикл (monitor_position);
+    ручные команды (/rebalance, /addliquidity) по-прежнему работают."""
+    import main
+
+    main.bot_paused = True
+    await _reply(
+        update,
+        context,
+        "⏸ Автоматика приостановлена — авто-мониторинг и авто-ребаланс не работают.\n"
+        "Ручные команды (/rebalance, /addliquidity) по-прежнему доступны.\n"
+        "Вернуть всё: /boevoy",
+    )
+
+
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/stop — полная заморозка: и автоматика, и денежные ручные команды отключены."""
+    import main
+
+    main.bot_frozen = True
+    await _reply(
+        update,
+        context,
+        "🛑 Полная заморозка — автоматика и /rebalance, /addliquidity отключены.\n"
+        "Вернуть всё: /boevoy",
+    )
+
+
+async def boevoy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/boevoy — снимает разом /pauza и /stop, полный боевой режим."""
+    import main
+
+    main.bot_paused = False
+    main.bot_frozen = False
+    await _reply(
+        update,
+        context,
+        "⚔️ Боевой режим — автоматика и все ручные команды снова работают.",
+    )
+
+
 def build_telegram_app() -> Application:
     """Создаёт и настраивает Telegram приложение с командами."""
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -646,6 +697,9 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("setrange", setrange_command, filters=owner_chat))
     app.add_handler(CommandHandler("rebalance", rebalance_command, filters=owner_chat))
     app.add_handler(CommandHandler("addliquidity", addliquidity_command, filters=owner_chat))
+    app.add_handler(CommandHandler("pauza", pauza_command, filters=owner_chat))
+    app.add_handler(CommandHandler("stop", stop_command, filters=owner_chat))
+    app.add_handler(CommandHandler("boevoy", boevoy_command, filters=owner_chat))
     # Чужие чаты: только warning в лог, без ответа (не светим, что бот живой).
     app.add_handler(
         CommandHandler(
