@@ -29,6 +29,7 @@ _bot: Bot | None = None
 # Команды, доступные только владельцу (TELEGRAM_CHAT_ID).
 _OWNER_COMMANDS = (
     "status", "setrange", "rebalance", "addliquidity", "open", "pauza", "stop", "boevoy",
+    "withdraw",
 )
 
 
@@ -812,6 +813,65 @@ async def boevoy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /withdraw — полный вывод SOL+USDC из кошелька бота на WITHDRAWAL_ADDRESS (адрес
+    задан только в .env, НЕ аргументом команды — так команду физически нельзя
+    отправить куда-то ещё). Двухшаговое подтверждение через отдельный аргумент
+    "confirm", а не через сохранённое между сообщениями состояние — так надёжнее:
+    /withdraw confirm либо срабатывает по своим собственным свежим данным, либо нет,
+    без риска зависшего "ожидания подтверждения" от предыдущего сообщения.
+
+    Намеренно НЕ проверяет main.bot_frozen и main._rebalance_lock — это единственная
+    команда, которая должна работать даже при /stop (аварийный выход должен быть
+    доступен именно тогда, когда всё остальное остановлено, а не наоборот).
+    """
+    import config
+    from orca import withdraw_all
+    from solana_client import get_sol_balance, get_usdc_balance
+
+    if config.is_placeholder(config.WITHDRAWAL_ADDRESS):
+        await _reply(
+            update,
+            context,
+            "❌ WITHDRAWAL_ADDRESS не задан в .env — сначала укажи адрес назначения там.",
+        )
+        return
+
+    confirmed = bool(context.args) and context.args[0].lower() == "confirm"
+
+    if not confirmed:
+        sol_balance = await get_sol_balance()
+        usdc_balance = await get_usdc_balance()
+        sol_line = f"{sol_balance:.4f}" if sol_balance is not None else "?"
+        usdc_line = f"{usdc_balance:.2f}" if usdc_balance is not None else "?"
+        await _reply(
+            update,
+            context,
+            f"⚠️ <b>Вывести ВСЁ на:</b>\n<code>{config.WITHDRAWAL_ADDRESS}</code>\n\n"
+            f"SOL: {sol_line}\nUSDC: {usdc_line}\n\n"
+            f"Открытая позиция (если есть) НЕ закрывается — выводится только то, что "
+            f"уже в кошельке.\nПодтвердить: /withdraw confirm",
+            parse_mode="HTML",
+        )
+        return
+
+    await _reply(update, context, "💸 Вывожу...")
+    try:
+        result = await withdraw_all(config.WITHDRAWAL_ADDRESS)
+        await _reply(
+            update,
+            context,
+            f"✅ <b>Выведено</b>\n"
+            f"SOL: {result['sol_sent']:.4f}\nUSDC: {result['usdc_sent']:.2f}\n"
+            f"tx: <code>{result['signature']}</code>",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        log.exception("Ошибка при /withdraw: %s", e)
+        await _reply(update, context, f"❌ Ошибка: {e!r}")
+
+
 # Список для кнопки "Меню" в Telegram (иконка рядом с полем ввода) — штатная функция
 # клиента, не кастомная клавиатура. Нажатие на пункт сразу отправляет команду как
 # есть, без аргумента — для /setrange, /addliquidity, /open дальше как обычно нужно
@@ -826,6 +886,7 @@ _MENU_COMMANDS = [
     BotCommand("pauza", "Пауза автоматики"),
     BotCommand("stop", "Полная заморозка"),
     BotCommand("boevoy", "Вернуть в боевой режим"),
+    BotCommand("withdraw", "Вывести всё из кошелька (нужно подтверждение)"),
 ]
 
 
@@ -855,6 +916,7 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("pauza", pauza_command, filters=owner_chat))
     app.add_handler(CommandHandler("stop", stop_command, filters=owner_chat))
     app.add_handler(CommandHandler("boevoy", boevoy_command, filters=owner_chat))
+    app.add_handler(CommandHandler("withdraw", withdraw_command, filters=owner_chat))
     # Чужие чаты: только warning в лог, без ответа (не светим, что бот живой).
     app.add_handler(
         CommandHandler(

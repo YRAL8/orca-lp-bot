@@ -1452,6 +1452,128 @@ async def estimate_add_liquidity_sol_needed(position: Position, usdc_amount: flo
         return wrapped_sol_lamports / 1_000_000_000
 
 
+# Фиксированный резерв SOL, который withdraw_all() НЕ выводит — покрывает fee самой
+# транзакции вывода плюс ренту ATA получателя, если её ещё нет on-chain. Не пытаемся
+# высчитать точную сумму (fee/rent меняются, но на этих порядках всегда с большим
+# запасом) — надёжность важнее выжимания последних лампортов на разовой операции.
+WITHDRAWAL_SOL_RESERVE = 0.003
+
+
+async def withdraw_all(destination_address: str) -> dict:
+    """
+    Полный вывод SOL и USDC из кошелька бота на destination_address. НЕ трогает
+    открытую LP-позицию — только то, что уже лежит в кошельке (позицию нужно закрыть
+    отдельно, если нужно вывести и её тоже). Один атомарный tx: перевод SOL +
+    перевод USDC (если баланс > 0), с созданием ATA получателя при необходимости.
+    """
+    from spl.token.instructions import (
+        transfer_checked,
+        TransferCheckedParams,
+        get_associated_token_address,
+    )
+    from spl.token.constants import TOKEN_PROGRAM_ID
+    from solders.system_program import transfer, TransferParams
+
+    wallet = get_wallet_keypair()
+    wallet_pubkey = wallet.pubkey()
+    dest_pubkey = Pubkey.from_string(destination_address)
+
+    async with get_client() as client:
+        usdc_mint_pubkey = Pubkey.from_string(USDC_MINT)
+        source_ata = get_associated_token_address(wallet_pubkey, usdc_mint_pubkey)
+
+        usdc_raw_amount = 0
+        usdc_decimals = 6
+        try:
+            usdc_resp = await client.get_token_account_balance(source_ata)
+            if usdc_resp.value is not None:
+                usdc_raw_amount = int(usdc_resp.value.amount)
+                usdc_decimals = usdc_resp.value.decimals
+        except Exception as e:
+            if "could not find account" not in str(e).lower():
+                raise
+
+        sol_balance_resp = await client.get_balance(wallet_pubkey)
+        sol_lamports = sol_balance_resp.value
+
+        instructions: list = []
+
+        if usdc_raw_amount > 0:
+            dest_ata = await TokenUtil.resolve_or_create_ata(
+                client,
+                dest_pubkey,
+                usdc_mint_pubkey,
+                funder=wallet_pubkey,
+                idempotent=True,
+            )
+            instructions.append(dest_ata.instruction)
+            transfer_checked_ix = transfer_checked(
+                TransferCheckedParams(
+                    program_id=TOKEN_PROGRAM_ID,
+                    source=source_ata,
+                    mint=usdc_mint_pubkey,
+                    dest=dest_ata.pubkey,
+                    owner=wallet_pubkey,
+                    amount=usdc_raw_amount,
+                    decimals=usdc_decimals,
+                    signers=[],
+                )
+            )
+            # transfer_checked()/transfer() возвращают "голый" solders.Instruction, а
+            # tx_builder.add_instruction() ждёт обёртку orca_whirlpool Instruction
+            # (instructions/cleanup_instructions/signers) — та же обёртка, что и для
+            # open_position_ix выше по файлу.
+            instructions.append(
+                Instruction(instructions=[transfer_checked_ix], cleanup_instructions=[], signers=[])
+            )
+
+        reserve_lamports = round(WITHDRAWAL_SOL_RESERVE * 1_000_000_000)
+        sol_lamports_to_send = sol_lamports - reserve_lamports
+        if sol_lamports_to_send > 0:
+            transfer_ix = transfer(
+                TransferParams(
+                    from_pubkey=wallet_pubkey,
+                    to_pubkey=dest_pubkey,
+                    lamports=sol_lamports_to_send,
+                )
+            )
+            instructions.append(
+                Instruction(instructions=[transfer_ix], cleanup_instructions=[], signers=[])
+            )
+
+        if not instructions:
+            raise ValueError("Нечего выводить — кошелёк пуст (SOL и USDC на нуле)")
+
+        tx_builder = TransactionBuilder(client, wallet)
+        tx_builder.set_compute_unit_limit(60_000)
+        tx_builder.set_compute_unit_price(config.PRIORITY_FEE_MICROLAMPORTS)
+        for ix in instructions:
+            tx_builder.add_instruction(ix)
+
+        log.info(
+            "Prepared REAL withdraw_all tx (not sent): dest=%s sol_lamports=%d usdc_raw=%d",
+            dest_pubkey,
+            sol_lamports_to_send if sol_lamports_to_send > 0 else 0,
+            usdc_raw_amount,
+        )
+
+        signature = await tx_builder.build_and_execute()
+        status_resp = await _get_signature_status_with_retry(client, signature)
+        status = status_resp.value[0]
+        if status is None or status.err is not None:
+            raise RuntimeError(
+                f"Транзакция withdraw_all не удалась on-chain: signature={signature} "
+                f"err={status.err if status else 'нет статуса'}"
+            )
+        log.info("withdraw_all успешно отправлена и подтверждена: %s", signature)
+
+        return {
+            "signature": str(signature),
+            "sol_sent": max(sol_lamports_to_send, 0) / 1_000_000_000,
+            "usdc_sent": usdc_raw_amount / 10**usdc_decimals,
+        }
+
+
 async def add_liquidity(position: Position, usdc_amount: float) -> Optional[Position]:
     """
     Доливает ликвидность в УЖЕ открытую позицию (increase_liquidity на её существующий
