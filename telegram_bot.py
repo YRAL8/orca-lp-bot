@@ -28,7 +28,7 @@ _bot: Bot | None = None
 
 # Команды, доступные только владельцу (TELEGRAM_CHAT_ID).
 _OWNER_COMMANDS = (
-    "status", "setrange", "rebalance", "addliquidity", "pauza", "stop", "boevoy",
+    "status", "setrange", "rebalance", "addliquidity", "open", "pauza", "stop", "boevoy",
 )
 
 
@@ -516,6 +516,110 @@ async def rebalance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await notify_rebalance_error(str(e))
 
 
+async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Обработчик /open <сумма USDC> — открывает НОВУЮ позицию, когда открытой позиции
+    сейчас нет (после ручного/автоматического close, если reopen не удался — например
+    из-за 429 на отправке транзакции, см. инцидент 2026-07-27). В отличие от
+    /rebalance, не требует существующей позиции для старта; в отличие от
+    /addliquidity, создаёт новый диапазон вокруг текущей цены (RANGE_WIDTH_PCT),
+    а не доливает в старый.
+    """
+    global current_position
+
+    import config
+    from orca import get_position, open_position, get_current_price
+
+    import main
+
+    if main.bot_frozen:
+        await _reply(update, context, "🛑 Бот заморожен (/stop) — сначала /boevoy.")
+        return
+
+    if main._rebalance_lock.locked():
+        await _reply(update, context, "⏳ Идёт ребаланс/открытие — подожди.")
+        return
+
+    if not context.args:
+        await _reply(
+            update,
+            context,
+            "Использование: /open &lt;сумма USDC&gt;\nПример: /open 5",
+            parse_mode="HTML",
+        )
+        return
+
+    try:
+        usdc_amount = float(context.args[0])
+    except ValueError:
+        await _reply(update, context, "❌ Нужно число, например: /open 5")
+        return
+
+    if usdc_amount <= 0:
+        await _reply(update, context, "❌ Сумма должна быть больше 0.")
+        return
+
+    async with main._rebalance_lock:
+        try:
+            existing = await get_position()
+        except Exception as e:
+            await _reply(update, context, f"❌ Не удалось проверить текущую позицию: {e}")
+            return
+
+        if existing is not None and not existing.is_demo:
+            await _reply(
+                update,
+                context,
+                f"❌ Позиция уже открыта (${existing.total_value_usd:.2f}) — "
+                "используй /rebalance или /addliquidity, а не /open.",
+            )
+            return
+
+        usdc_balance = await get_usdc_balance()
+        sol_balance = await get_sol_balance()
+        if usdc_balance is not None and usdc_amount > usdc_balance:
+            await _reply(
+                update,
+                context,
+                f"❌ Запрошено ${usdc_amount:.2f} USDC, на кошельке только ${usdc_balance:.2f} USDC.",
+            )
+            return
+        # OPEN_POSITION_RENT_RESERVE_SOL — отдельный резерв именно под безвозвратную
+        # ренту НОВОЙ позиции (position PDA + mint + ATA + metadata), см. config.py.
+        # Не путать с MIN_SOL_BALANCE — тот только порог алерта "мало SOL".
+        required_reserve = config.MIN_SOL_BALANCE + config.OPEN_POSITION_RENT_RESERVE_SOL
+        if sol_balance is not None and sol_balance < required_reserve:
+            await _reply(
+                update,
+                context,
+                f"❌ Мало SOL для открытия новой позиции: есть {sol_balance:.4f}, "
+                f"нужно минимум {required_reserve:.4f} (резерв на ренту + MIN_SOL_BALANCE).",
+            )
+            return
+
+        await _reply(update, context, f"🆕 Открываю новую позицию на ${usdc_amount:.2f} USDC...")
+
+        try:
+            current_price = await get_current_price()
+            new_position = await open_position(current_price, usdc_amount=usdc_amount)
+            if new_position:
+                current_position = new_position
+                await _reply(
+                    update,
+                    context,
+                    f"✅ <b>Позиция открыта</b>\n"
+                    f"💰 ${new_position.total_value_usd:.2f} "
+                    f"(SOL ${new_position.value_sol_usd:.2f} + USDC ${new_position.value_usdc_usd:.2f})\n"
+                    f"Диапазон: ${new_position.lower_price:.2f}–${new_position.upper_price:.2f}",
+                    parse_mode="HTML",
+                )
+            else:
+                await _reply(update, context, "❌ Не удалось подтвердить открытие позиции.")
+        except Exception as e:
+            log.exception("Ошибка при /open: %s", e)
+            await _reply(update, context, f"❌ Ошибка: {e!r}")
+
+
 async def addliquidity_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Обработчик /addliquidity <сумма USDC> — доливает ликвидность В ТЕКУЩУЮ открытую
@@ -697,6 +801,7 @@ def build_telegram_app() -> Application:
     app.add_handler(CommandHandler("setrange", setrange_command, filters=owner_chat))
     app.add_handler(CommandHandler("rebalance", rebalance_command, filters=owner_chat))
     app.add_handler(CommandHandler("addliquidity", addliquidity_command, filters=owner_chat))
+    app.add_handler(CommandHandler("open", open_command, filters=owner_chat))
     app.add_handler(CommandHandler("pauza", pauza_command, filters=owner_chat))
     app.add_handler(CommandHandler("stop", stop_command, filters=owner_chat))
     app.add_handler(CommandHandler("boevoy", boevoy_command, filters=owner_chat))
