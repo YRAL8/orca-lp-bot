@@ -512,19 +512,25 @@ async def rebalance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await _reply(update, context, "⏳ Ребаланс уже выполняется — подожди.")
         return
 
-    try:
-        position = await get_position()
-    except Exception as e:
-        await _reply(update, context, f"❌ Не удалось загрузить позицию: {e}")
-        return
-
-    if position is None:
-        await _reply(update, context, "❌ Нет открытой позиции для ребаланса.")
-        return
-
-    await _reply(update, context, "🔄 Начинаю ручной ребаланс...")
-
+    # Позицию читаем ВНУТРИ лока (как /addliquidity), а не до него — иначе между
+    # этим чтением и взятием лока ниже мог успеть отработать другой ребаланс
+    # (авто или второй ручной клик), и rebalance(position) получил бы устаревший
+    # объект позиции. Не риск для денег (текущий владелец лока отработал бы
+    # корректно), но давало непонятную "❌ Ошибка ребаланса" на стороне проигравшего
+    # (найдено как M1, 2026-07-27).
     async with main._rebalance_lock:
+        try:
+            position = await get_position()
+        except Exception as e:
+            await _reply(update, context, f"❌ Не удалось загрузить позицию: {e!r}")
+            return
+
+        if position is None:
+            await _reply(update, context, "❌ Нет открытой позиции для ребаланса.")
+            return
+
+        await _reply(update, context, "🔄 Начинаю ручной ребаланс...")
+
         try:
             await notify_rebalance_start(position)
             new_position = await rebalance(position)
@@ -535,7 +541,7 @@ async def rebalance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 await notify_rebalance_error("Не удалось выполнить ребаланс")
         except Exception as e:
             log.exception("Ошибка при ручном /rebalance: %s", e)
-            await notify_rebalance_error(str(e))
+            await notify_rebalance_error(repr(e))
 
 
 async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -690,7 +696,7 @@ async def addliquidity_command(update: Update, context: ContextTypes.DEFAULT_TYP
         try:
             position = await get_position()
         except Exception as e:
-            await _reply(update, context, f"❌ Не удалось загрузить позицию: {e}")
+            await _reply(update, context, f"❌ Не удалось загрузить позицию: {e!r}")
             return
 
         if position is None:
@@ -722,7 +728,7 @@ async def addliquidity_command(update: Update, context: ContextTypes.DEFAULT_TYP
         try:
             required_sol = await estimate_add_liquidity_sol_needed(position, usdc_amount)
         except Exception as e:
-            await _reply(update, context, f"❌ Не удалось оценить нужный SOL: {e}")
+            await _reply(update, context, f"❌ Не удалось оценить нужный SOL: {e!r}")
             return
 
         if sol_balance is not None:
@@ -762,7 +768,7 @@ async def addliquidity_command(update: Update, context: ContextTypes.DEFAULT_TYP
                 await _reply(update, context, "❌ Не удалось подтвердить доливку.")
         except Exception as e:
             log.exception("Ошибка при /addliquidity: %s", e)
-            await _reply(update, context, f"❌ Ошибка: {e}")
+            await _reply(update, context, f"❌ Ошибка: {e!r}")
 
 
 async def pauza_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

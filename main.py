@@ -220,14 +220,29 @@ async def monitor_position() -> None:
 
         async with _rebalance_lock:
             try:
-                log.info("Начинаем ребаланс...")
-                await tg.notify_rebalance_start(position)
+                # Перечитываем позицию свежо, ВНУТРИ лока — `position` наверху этой
+                # функции могла устареть: между тем чтением и этим моментом было
+                # несколько await (баланс SOL, повторная проверка цены), и за это
+                # время мог успеть отработать ручной /rebalance (найдено как M1,
+                # 2026-07-27). Работать с устаревшим объектом опасно (close_position
+                # мог бы целиться в уже закрытую позицию).
+                fresh_position = await get_position()
+                if fresh_position is None:
+                    log.warning(
+                        "Позиция исчезла между тиком мониторинга и взятием лока — "
+                        "пропускаем автоматический ребаланс"
+                    )
+                    _reset_rpc_error_state()
+                    return
 
-                new_position = await rebalance(position)
+                log.info("Начинаем ребаланс...")
+                await tg.notify_rebalance_start(fresh_position)
+
+                new_position = await rebalance(fresh_position)
 
                 if new_position:
                     tg.current_position = new_position
-                    await tg.notify_rebalance_complete(position, new_position)
+                    await tg.notify_rebalance_complete(fresh_position, new_position)
                     log.info(f"Ребаланс завершён. Новый диапазон: ${new_position.lower_price:.2f}—${new_position.upper_price:.2f}")
                 else:
                     await tg.notify_rebalance_error("Не удалось выполнить ребаланс")
@@ -235,7 +250,7 @@ async def monitor_position() -> None:
 
             except Exception as e:
                 log.exception(f"Ошибка при ребалансе: {e}")
-                await tg.notify_rebalance_error(str(e))
+                await tg.notify_rebalance_error(repr(e))
 
         _reset_rpc_error_state()
     except Exception as e:
