@@ -1366,6 +1366,15 @@ async def open_position(current_price: float, usdc_amount: Optional[float] = Non
             in_range=True,
             is_demo=False,
         )
+        # Без этого amount_sol/amount_usdc/*_value_usd остаются на дефолтных 0.0
+        # (Position их не заполняет сама) — раньше это было незаметно, потому что
+        # ни один вызывающий код не печатал эти поля из возврата open_position()
+        # напрямую (notify_rebalance_complete печатает только диапазон и fees
+        # СТАРОЙ позиции). Впервые проявилось вживую через новую команду /open,
+        # которая как раз показывает total_value_usd/value_sol_usd/value_usdc_usd
+        # из свежесозданной позиции — 2026-07-27, "$0.00" при реально открытой на
+        # $1.93 позиции.
+        _fill_position_amounts(position, whirlpool, tick_lower, tick_upper, dec_a, dec_b)
         return position
 
 
