@@ -38,7 +38,7 @@ from orca_whirlpool.utils import (
 from orca_whirlpool.transaction import TransactionBuilder, Instruction
 from orca_whirlpool.instruction import (
     WhirlpoolIx,
-    OpenPositionWithMetadataParams,
+    OpenPositionParams,
     IncreaseLiquidityParams,
     InitializeTickArrayParams,
     DecreaseLiquidityParams,
@@ -1154,7 +1154,11 @@ async def open_position(current_price: float, usdc_amount: Optional[float] = Non
         position_mint_keypair = Keypair()
         position_mint = position_mint_keypair.pubkey()
         position_pda = PDAUtil.get_position(ORCA_WHIRLPOOL_PROGRAM_ID, position_mint)
-        metadata_pda = PDAUtil.get_position_metadata(position_mint)
+        # Открываем БЕЗ Metaplex-metadata (open_position, не open_position_with_metadata) —
+        # у неё своя безвозвратная рента (~0.0056 SOL), которую close_position() никогда не
+        # возвращает. На тестовом масштабе позиций этого бота ($1-3) это ощутимая доля
+        # стоимости на каждый ребаланс, а сама NFT-картинка боту не нужна — он не показывает
+        # позицию как NFT нигде, только следит за её адресом (найдено 2026-07-27, M5).
 
         token_owner_a = await TokenUtil.resolve_or_create_ata(
             client,
@@ -1174,9 +1178,10 @@ async def open_position(current_price: float, usdc_amount: Optional[float] = Non
         )
 
         # position_mint ещё не существует on-chain — его создаёт (is_signer=True) сама
-        # инструкция open_position_with_metadata, и она же создаёт position_token_account
-        # через CPI в ASSOCIATED_TOKEN_PROGRAM_ID (подтверждено чтением исходников
-        # anchorpy-обвязки: accounts включают ASSOCIATED_TOKEN_PROGRAM_ID). Отдельная
+        # инструкция open_position, и она же создаёт position_token_account через CPI в
+        # ASSOCIATED_TOKEN_PROGRAM_ID (подтверждено чтением исходников anchorpy-обвязки:
+        # accounts включают ASSOCIATED_TOKEN_PROGRAM_ID — та же структура аккаунтов, что и
+        # у open_position_with_metadata, минус сама metadata). Отдельная
         # create_associated_token_account здесь упала бы (mint ещё не создан) и вдобавок
         # была бы дублирующей — нашёл независимый аудит (Grok 4.5) 2026-07-26, подтвердил
         # чтением исходников.
@@ -1221,13 +1226,12 @@ async def open_position(current_price: float, usdc_amount: Optional[float] = Non
                 ),
             )
 
-        open_position_ix = WhirlpoolIx.open_position_with_metadata(
+        open_position_ix = WhirlpoolIx.open_position(
             ORCA_WHIRLPOOL_PROGRAM_ID,
-            OpenPositionWithMetadataParams(
+            OpenPositionParams(
                 tick_lower_index=tick_lower,
                 tick_upper_index=tick_upper,
                 position_pda=position_pda,
-                metadata_pda=metadata_pda,
                 funder=wallet_pubkey,
                 owner=wallet_pubkey,
                 position_mint=position_mint,
@@ -1283,12 +1287,11 @@ async def open_position(current_price: float, usdc_amount: Optional[float] = Non
             quote.liquidity,
         )
         log.info(
-            "Prepared addresses: wallet=%s position_mint=%s position_pda=%s metadata_pda=%s "
+            "Prepared addresses: wallet=%s position_mint=%s position_pda=%s "
             "pos_token_ata=%s owner_ata_a=%s owner_ata_b=%s tick_array_lower=%s tick_array_upper=%s",
             wallet_pubkey,
             position_mint,
             position_pda.pubkey,
-            metadata_pda.pubkey,
             position_token_account,
             token_owner_a.pubkey,
             token_owner_b.pubkey,
