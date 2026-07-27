@@ -1452,6 +1452,38 @@ async def estimate_add_liquidity_sol_needed(position: Position, usdc_amount: flo
         return wrapped_sol_lamports / 1_000_000_000
 
 
+async def compute_max_addliquidity_usdc(
+    position: Position, usdc_balance: float, sol_balance: float
+) -> float:
+    """
+    Максимальная сумма USDC для /addliquidity, которую реально можно внести прямо
+    сейчас — с учётом ОБЕИХ границ: сколько USDC вообще есть в кошельке, и сколько
+    свободного SOL (за вычетом MIN_SOL_BALANCE) есть под вторую ногу депозита.
+
+    Котировка increase_liquidity линейна по входной сумме при фиксированной
+    цене/диапазоне пула — проверено эмпирически 2026-07-27 (0.5/0.7/0.9/1.0 USDC
+    дали одно и то же отношение SOL/USDC с точностью до третьего знака), поэтому
+    одна референсная оценка на $1 достаточна вместо перебора/бинарного поиска.
+    """
+    if usdc_balance <= 0:
+        return 0.0
+
+    reference_sol_needed = await estimate_add_liquidity_sol_needed(position, 1.0)
+    if reference_sol_needed <= 0:
+        # Позиция вне диапазона, вход целиком в USDC — SOL вторая нога не нужна.
+        return usdc_balance
+
+    usable_sol = max(0.0, sol_balance - config.MIN_SOL_BALANCE)
+    max_by_sol = usable_sol / reference_sol_needed
+    max_amount = min(usdc_balance, max_by_sol)
+
+    # 2% запас — цена между этой оценкой и реальной отправкой может слегка
+    # сдвинуться, тот же класс погрешности, что и в других местах этого файла
+    # (_REOPEN_SAFETY_HAIRCUT и т.п.) — берём чуть меньше расчётного максимума,
+    # а не ровно 100%, чтобы не упереться в "не хватило на пару лампортов".
+    return max(0.0, max_amount * 0.98)
+
+
 async def add_liquidity(position: Position, usdc_amount: float) -> Optional[Position]:
     """
     Доливает ликвидность в УЖЕ открытую позицию (increase_liquidity на её существующий

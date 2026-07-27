@@ -652,14 +652,24 @@ async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def addliquidity_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Обработчик /addliquidity <сумма USDC> — доливает ликвидность В ТЕКУЩУЮ открытую
-    позицию (increase_liquidity на её существующий диапазон), без close/reopen. Сумму
-    выбирает владелец каждый раз явно; бот только проверяет баланс/состояние позиции
-    перед отправкой, ничего не решает и не лимитирует сам.
+    позицию (increase_liquidity на её существующий диапазон), без close/reopen.
+
+    Спецаргумент /addliquidity max (или "все"/"всё") — сам считает максимально
+    безопасную сумму под ТЕКУЩИЙ баланс (и USDC, и свободный SOL после
+    MIN_SOL_BALANCE), вместо того чтобы гадать и упираться в отказ "не хватает SOL"
+    (найдено 2026-07-27: сумма в $ — это только USDC-нога, вторая (SOL) считается
+    ботом отдельно и может оказаться главным ограничением, если большая часть SOL в
+    кошельке зарезервирована под газ).
     """
     global current_position
 
     import config
-    from orca import get_position, add_liquidity, estimate_add_liquidity_sol_needed
+    from orca import (
+        get_position,
+        add_liquidity,
+        estimate_add_liquidity_sol_needed,
+        compute_max_addliquidity_usdc,
+    )
 
     # Тот же лок, что и у /rebalance и автоматического ребаланса — доливка во время
     # close/reopen целилась бы в position_pda, которого в этот момент может уже не быть
@@ -674,24 +684,41 @@ async def addliquidity_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await _reply(update, context, "⏳ Идёт ребаланс — подожди, потом долей.")
         return
 
+    want_max = bool(context.args) and context.args[0].lower() in ("max", "все", "всё", "весь")
+
     if not context.args:
+        try:
+            position = await get_position()
+        except Exception:
+            position = None
+        suggestion = ""
+        if position is not None and not position.is_demo:
+            usdc_balance = await get_usdc_balance()
+            sol_balance = await get_sol_balance()
+            if usdc_balance is not None and sol_balance is not None:
+                max_amount = await compute_max_addliquidity_usdc(position, usdc_balance, sol_balance)
+                suggestion = f"\nМаксимум безопасно сейчас: ~${max_amount:.2f} (/addliquidity max)"
         await _reply(
             update,
             context,
-            "Использование: /addliquidity &lt;сумма USDC&gt;\nПример: /addliquidity 5",
+            "Использование: /addliquidity &lt;сумма USDC&gt;\nПример: /addliquidity 5"
+            f"{suggestion}",
             parse_mode="HTML",
         )
         return
 
-    try:
-        usdc_amount = float(context.args[0])
-    except ValueError:
-        await _reply(update, context, "❌ Нужно число, например: /addliquidity 5")
-        return
+    if want_max:
+        usdc_amount = None  # досчитаем ниже, когда узнаем баланс и позицию
+    else:
+        try:
+            usdc_amount = float(context.args[0])
+        except ValueError:
+            await _reply(update, context, "❌ Нужно число, например: /addliquidity 5, или /addliquidity max")
+            return
 
-    if usdc_amount <= 0:
-        await _reply(update, context, "❌ Сумма должна быть больше 0.")
-        return
+        if usdc_amount <= 0:
+            await _reply(update, context, "❌ Сумма должна быть больше 0.")
+            return
 
     async with main._rebalance_lock:
         try:
@@ -713,6 +740,16 @@ async def addliquidity_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
         usdc_balance = await get_usdc_balance()
         sol_balance = await get_sol_balance()
+
+        if want_max:
+            if usdc_balance is None or sol_balance is None:
+                await _reply(update, context, "❌ Кошелёк не настроен (read-only) — max недоступен.")
+                return
+            usdc_amount = await compute_max_addliquidity_usdc(position, usdc_balance, sol_balance)
+            if usdc_amount <= 0:
+                await _reply(update, context, "❌ Нечем доливать — свободного USDC или SOL нет.")
+                return
+
         if usdc_balance is not None and usdc_amount > usdc_balance:
             await _reply(
                 update,
