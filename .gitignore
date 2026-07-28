@@ -5,5 +5,8 @@ __pycache__/
 bot.log
 *.log
 
+# Persistent runtime data (mounted to /app/data in Docker)
+data/
+
 # Private planning notes — not for the public repo
 ROADMAP.md

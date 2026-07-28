@@ -7,6 +7,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import bot_state
 import config
 import telegram_bot as tg
+import cycle_journal
 from orca import get_position, rebalance, get_current_price, reopen_after_failed_rebalance
 from solana_client import get_sol_balance
 from config import (
@@ -202,6 +203,12 @@ async def monitor_position() -> None:
         tg.current_position = position
         tg.price_history.append(position.current_price)
 
+        # Наблюдатель рынка по текущему циклу (не влияет на деньги).
+        if not getattr(position, "is_demo", False):
+            j = cycle_journal.get_default_journal()
+            cycle_journal.safe_call(j.ensure_active_from_position, position, force_incomplete=True)
+            cycle_journal.safe_call(j.on_monitor_tick, float(position.current_price))
+
         log.info(
             f"Цена: ${position.current_price:.2f} | "
             f"Позиция: ${position.total_value_usd:.2f} "
@@ -361,6 +368,17 @@ async def main() -> None:
     except Exception as e:
         tg.current_position = None
         log.exception("Не удалось получить позицию при старте: %s", e)
+        position = None
+
+    # Если бот перезапущен посреди цикла — помечаем текущий цикл неполным.
+    # (observer-only, в DRY_RUN ничего на диск не пишет).
+    try:
+        j = cycle_journal.get_default_journal()
+        cycle_journal.safe_call(j.mark_startup_restart_incomplete)
+        if position is not None and not getattr(position, "is_demo", False):
+            cycle_journal.safe_call(j.ensure_active_from_position, position, force_incomplete=True)
+    except Exception:
+        log.warning("CycleJournal startup hook failed", exc_info=True)
 
     # Уведомляем о запуске
     try:

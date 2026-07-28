@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from collections import deque
 from telegram import BotCommand, Update, Bot
@@ -30,9 +31,16 @@ _bot: Bot | None = None
 
 # Команды, доступные только владельцу (TELEGRAM_CHAT_ID).
 _OWNER_COMMANDS = (
-    "status", "setrange", "rebalance", "addliquidity", "open", "pauza", "stop", "boevoy",
+    "status", "setrange", "rebalance", "addliquidity", "open", "pauza", "stop", "boevoy", "pnl",
     "withdraw",
 )
+
+# Пороги классификации рынка по извилистости (efficiency):
+# - < SIDEWAYS_MAX => боковик
+# - > TREND_MIN    => тренд
+# - между          => смешанный
+_EFF_SIDEWAYS_MAX = 0.3
+_EFF_TREND_MIN = 0.7
 
 
 def _owner_chat_id() -> int | None:
@@ -446,6 +454,115 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception as e:
         log.exception("Ошибка /status: %s", e)
         await _reply(update, context, f"❌ Ошибка /status: {e}")
+
+
+def _market_bucket(efficiency: float | None) -> str:
+    if efficiency is None:
+        return "смешанный"
+    if efficiency < _EFF_SIDEWAYS_MAX:
+        return "боковик"
+    if efficiency > _EFF_TREND_MIN:
+        return "тренд"
+    return "смешанный"
+
+
+def _fmt_money(x: float) -> str:
+    sign = "+" if x >= 0 else "−"
+    return f"{sign}${abs(x):.2f}"
+
+
+def _render_pnl_message(*, cycles: list[dict], recent_limit: int = 10) -> str:
+    if not cycles:
+        return (
+            "📈 <b>PnL по циклам</b>\n"
+            "Данных пока нет — журнал пуст.\n"
+            "Совет: накопи хотя бы несколько ребалансов, потом вернись к /pnl."
+        )
+
+    recent = cycles[-recent_limit:]
+    lines: list[str] = []
+    lines.append("📈 <b>PnL по циклам</b>")
+    lines.append("")
+    lines.append(f"Последние {len(recent)} циклов:")
+    for c in reversed(recent):
+        close_t = str(c.get("close_time_utc", ""))[:16].replace("T", " ")
+        width = float(c.get("range_width_pct", 0.0))
+        dur_h = float(c.get("duration_hours", 0.0))
+        fees_usd = float(c.get("fees_usd", 0.0))
+        div_usd = float(c.get("divergence_usd", 0.0))
+        pnl = float(c.get("pnl_usd", 0.0))
+        eff = c.get("efficiency", None)
+        eff_s = "None" if eff is None else f"{float(eff):.2f}"
+        incomplete = bool(c.get("incomplete", False))
+        mark = " ⚠️" if incomplete else ""
+        lines.append(
+            f"{close_t}Z | ±{width:.1f}% | {dur_h:.2f}h | fees ${fees_usd:.2f} | "
+            f"div {_fmt_money(div_usd)} | итог {_fmt_money(pnl)} | eff {eff_s}{mark}"
+        )
+
+    # Summary: grouped by width and market bucket; exclude incomplete cycles.
+    complete = [c for c in cycles if not bool(c.get("incomplete", False))]
+    lines.append("")
+    lines.append("<b>Сводка (без неполных циклов)</b>")
+    if not complete:
+        lines.append("Нет полных циклов для сводки (все помечены как неполные).")
+        return "\n".join(lines)
+
+    by_width: dict[float, list[dict]] = {}
+    for c in complete:
+        w = float(c.get("range_width_pct", 0.0))
+        by_width.setdefault(w, []).append(c)
+
+    for w in sorted(by_width.keys()):
+        group = by_width[w]
+        lines.append(f"")
+        lines.append(f"Ширина ±{w:.1f}%:")
+        buckets = {"боковик": [], "тренд": [], "смешанный": []}
+        for c in group:
+            eff = c.get("efficiency", None)
+            eff_v = None if eff is None else float(eff)
+            buckets[_market_bucket(eff_v)].append(c)
+
+        for name in ("боковик", "тренд", "смешанный"):
+            items = buckets[name]
+            if not items:
+                lines.append(f"  {name:<8} — нет данных")
+                continue
+            total_pnl = sum(float(i.get("pnl_usd", 0.0)) for i in items)
+            total_h = sum(max(0.0, float(i.get("duration_hours", 0.0))) for i in items)
+            avg_per_h = (total_pnl / total_h) if total_h > 0 else 0.0
+            lines.append(
+                f"  {name:<8} — {len(items)} циклов, итого {_fmt_money(total_pnl)}, в среднем {_fmt_money(avg_per_h)}/ч"
+            )
+
+    return "\n".join(lines)
+
+
+async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик /pnl — журнал циклов и сводка по ширине/характеру рынка."""
+    try:
+        import cycle_journal
+
+        j = cycle_journal.get_default_journal()
+        # Read full JSONL (small file by design).
+        cycles: list[dict] = []
+        try:
+            with open(j.journal_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        cycles.append(json.loads(line))
+                    except Exception:
+                        continue
+        except FileNotFoundError:
+            cycles = []
+        text = _render_pnl_message(cycles=cycles, recent_limit=10)
+        await _reply(update, context, text, parse_mode="HTML")
+    except Exception as e:
+        log.exception("Ошибка /pnl: %s", e)
+        await _reply(update, context, f"❌ Ошибка /pnl: {e!r}")
 
 
 async def setrange_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -953,6 +1070,17 @@ async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             if not closed:
                 await _reply(update, context, "❌ Не удалось закрыть позицию.")
                 return
+
+            # Наблюдатель: /withdraw — намеренное закрытие, цикл должен закрыться "нормально".
+            try:
+                import cycle_journal
+
+                j = cycle_journal.get_default_journal()
+                cycle_journal.safe_call(j.capture_close_snapshot, position)
+                cycle_journal.safe_call(j.finalize_pending_cycle)
+            except Exception:
+                log.warning("CycleJournal hook failed in /withdraw", exc_info=True)
+
             await _reply(
                 update,
                 context,
@@ -970,6 +1098,7 @@ async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 # команд, а не собирает аргументы).
 _MENU_COMMANDS = [
     BotCommand("status", "Статус позиции и баланс"),
+    BotCommand("pnl", "PnL по циклам (журнал)"),
     BotCommand("rebalance", "Ребаланс прямо сейчас"),
     BotCommand("addliquidity", "Долить ликвидность (нужна сумма)"),
     BotCommand("open", "Открыть новую позицию (нужна сумма)"),
@@ -1000,6 +1129,7 @@ def build_telegram_app() -> Application:
 
     owner_chat = filters.Chat(chat_id=owner_id)
     app.add_handler(CommandHandler("status", status_command, filters=owner_chat))
+    app.add_handler(CommandHandler("pnl", pnl_command, filters=owner_chat))
     app.add_handler(CommandHandler("setrange", setrange_command, filters=owner_chat))
     app.add_handler(CommandHandler("rebalance", rebalance_command, filters=owner_chat))
     app.add_handler(CommandHandler("addliquidity", addliquidity_command, filters=owner_chat))

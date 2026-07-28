@@ -3,6 +3,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Persistent data (mounted in Docker as /app/data). Used for cycle journal/state.
+DATA_DIR = os.getenv("DATA_DIR", "/app/data").strip() or "/app/data"
+
 # Solana
 HELIUS_RPC_URL = os.getenv("HELIUS_RPC_URL", "").strip()
 # Публичный RPC — fallback для read-only dry-run без Helius

@@ -51,6 +51,7 @@ from orca_whirlpool.instruction import (
     SwapParams,
 )
 import config
+import cycle_journal
 from config import (
     WHIRLPOOL_ADDRESS,
     POSITION_MINT,
@@ -1335,6 +1336,15 @@ async def _swap_to_balance(current_price: float) -> bool:
                     f"err={status.err if status else 'нет статуса'}"
                 )
 
+            # Наблюдатель: фиксируем фактический своп для издержек цикла.
+            j = cycle_journal.get_default_journal()
+            cycle_journal.safe_call(
+                j.record_swap_success,
+                direction=direction,
+                amount_in=float(amount_in),
+                price=float(current_price),
+            )
+
             post_sol = await get_sol_balance()
             post_usdc = await get_usdc_balance()
             log.info(
@@ -1853,6 +1863,14 @@ async def open_position(
         # из свежесозданной позиции — 2026-07-27, "$0.00" при реально открытой на
         # $1.93 позиции.
         _fill_position_amounts(position, whirlpool, tick_lower, tick_upper, dec_a, dec_b)
+
+        # Наблюдатель: старт нового цикла (persist state). Никогда не роняет open_position.
+        j = cycle_journal.get_default_journal()
+        cycle_journal.safe_call(
+            j.on_open,
+            position,
+            range_width_pct=float(config.RANGE_WIDTH_PCT),
+        )
         return position
 
 
@@ -2128,6 +2146,10 @@ async def add_liquidity(position: Position, usdc_amount: float) -> Optional[Posi
             )
         log.info("add_liquidity успешно отправлена и подтверждена: %s", signature)
 
+        # Наблюдатель: доливка делает цикл "неполным" (состав позиции менялся внутри цикла).
+        j = cycle_journal.get_default_journal()
+        cycle_journal.safe_call(j.mark_add_liquidity_incomplete)
+
         # Синхронизируем глобальный POSITION_MINT с position.mint (тот же паттерн,
         # что в open_position()) — обычно уже совпадает, но если вызывающий код
         # держал не самый свежий Position, доливка сама по себе явное решение
@@ -2157,6 +2179,10 @@ async def rebalance(position: Position) -> Optional[Position]:
         log.error("Не удалось закрыть позицию")
         return None
 
+    # Наблюдатель: фиксируем закрытие цикла ДО свопа и ДО реоткрытия.
+    j = cycle_journal.get_default_journal()
+    cycle_journal.safe_call(j.capture_close_snapshot, position)
+
     # Теперь денег в пуле уже нет: любой сбой дальше оставляет капитал на кошельке.
     # Ставим персистентный флаг "нужно дожать реоткрытие" и снимаем его только
     # после успешного open_position().
@@ -2183,6 +2209,9 @@ async def rebalance(position: Position) -> Optional[Position]:
     except Exception:
         log.exception("Сбой при балансирующем свопе перед реоткрытием")
         return None
+
+    # Наблюдатель: цикл завершён, своп (если был) уже учтён — пишем JSONL строку.
+    cycle_journal.safe_call(j.finalize_pending_cycle)
 
     usdc_amount = None
     if not DRY_RUN:
@@ -2239,6 +2268,10 @@ async def reopen_after_failed_rebalance(current_price: float) -> Optional[Positi
     except Exception:
         log.exception("Сбой при балансирующем свопе перед повторным реоткрытием")
         return None
+
+    # Наблюдатель: если предыдущий цикл уже закрыт (pending_close), допишем его здесь.
+    j = cycle_journal.get_default_journal()
+    cycle_journal.safe_call(j.finalize_pending_cycle)
 
     usdc_amount = None
     if not DRY_RUN:

@@ -10,6 +10,7 @@ services:
     # найти файл для записи (поймано вживую на сервере, 2026-07-26).
     volumes:
       - ./.env:/app/.env
+      - ./data:/app/data
     logging:
       driver: json-file
       options:
