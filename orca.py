@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import logging
 
 from dotenv import find_dotenv, set_key
@@ -390,6 +391,43 @@ def _price_to_tick(price: float, decimals_a: int, decimals_b: int, tick_spacing:
     )
 
 
+def _aligned_range_ticks_and_prices(
+    current_price: float,
+    whirlpool,
+    decimals_a: int,
+    decimals_b: int,
+) -> tuple[int, int, float, float]:
+    """
+    Единый расчёт будущего диапазона (tick_lower/tick_upper) с учётом выравнивания
+    по сетке initializable ticks (tick_spacing).
+
+    ВАЖНО: этот helper должен использоваться ВЕЗДЕ, где бот планирует/оценивает
+    будущую позицию (swap, reopen quote, open_position), иначе появится рассинхрон.
+    """
+    if current_price <= 0:
+        raise ValueError("current_price должен быть > 0 для расчёта диапазона")
+
+    raw_lower = current_price * (1 - config.RANGE_WIDTH_PCT / 100)
+    raw_upper = current_price * (1 + config.RANGE_WIDTH_PCT / 100)
+    tick_lower = _price_to_tick(raw_lower, decimals_a, decimals_b, whirlpool.tick_spacing)
+    tick_upper = _price_to_tick(raw_upper, decimals_a, decimals_b, whirlpool.tick_spacing)
+
+    # Align displayed range with initializable ticks (rounding can be asymmetric).
+    lower_price = float(
+        DecimalUtil.to_fixed(
+            PriceMath.tick_index_to_price(tick_lower, decimals_a, decimals_b),
+            decimals_b,
+        )
+    )
+    upper_price = float(
+        DecimalUtil.to_fixed(
+            PriceMath.tick_index_to_price(tick_upper, decimals_a, decimals_b),
+            decimals_b,
+        )
+    )
+    return tick_lower, tick_upper, lower_price, upper_price
+
+
 def _fill_position_amounts(
     position: Position,
     whirlpool,
@@ -465,28 +503,15 @@ async def get_position() -> Optional[Position]:
             if DRY_RUN and DEMO_POSITION:
                 global _demo_range
                 if _demo_range is None:
-                    raw_lower = current_price * (1 - config.RANGE_WIDTH_PCT / 100)
-                    raw_upper = current_price * (1 + config.RANGE_WIDTH_PCT / 100)
-                    tick_lower = _price_to_tick(
-                        raw_lower, dec_a, dec_b, whirlpool.tick_spacing
+                    tick_lower, tick_upper, lower_price, upper_price = _aligned_range_ticks_and_prices(
+                        current_price=current_price,
+                        whirlpool=whirlpool,
+                        decimals_a=dec_a,
+                        decimals_b=dec_b,
                     )
-                    tick_upper = _price_to_tick(
-                        raw_upper, dec_a, dec_b, whirlpool.tick_spacing
-                    )
-                    # Align displayed range with ticks used for amounts (rounding can be asymmetric).
                     _demo_range = {
-                        "lower_price": float(
-                            DecimalUtil.to_fixed(
-                                PriceMath.tick_index_to_price(tick_lower, dec_a, dec_b),
-                                dec_b,
-                            )
-                        ),
-                        "upper_price": float(
-                            DecimalUtil.to_fixed(
-                                PriceMath.tick_index_to_price(tick_upper, dec_a, dec_b),
-                                dec_b,
-                            )
-                        ),
+                        "lower_price": lower_price,
+                        "upper_price": upper_price,
                         "tick_lower": tick_lower,
                         "tick_upper": tick_upper,
                     }
@@ -975,50 +1000,105 @@ def _compute_swap_amount(
     usdc_balance: float,
     current_price: float,
     min_sol_reserve: float,
+    target_sol_fraction: float = 0.5,
 ) -> tuple[str, float]:
     """
-    Чистая арифметика: определяет, нужно ли свопнуть кошелёк к 50/50 (по USD)
-    перед реоткрытием, и сколько именно.
+    Чистая арифметика: определяет, нужно ли свопнуть кошелёк к целевому соотношению
+    SOL/USDC (по USD) перед реоткрытием, и сколько именно.
 
     Возвращает (direction, amount):
     - direction: "SOL_TO_USDC", "USDC_TO_SOL" или "NONE"
     - amount: сумма входного токена в его натуральных единицах (SOL или USDC)
     """
-    if current_price <= 0:
-        return "NONE", 0.0
+    from orca_swap_math import compute_swap_amount
 
-    # ВАЖНО: net_sol_usd намеренно НЕ обрезается снизу нулём. Если SOL меньше
-    # резерва (типично после выхода цены ВВЕРХ: позиция закрылась в 100% USDC,
-    # а SOL ушёл на газ), то нам нужно докупить SOL не только до половины, но и
-    # на сам резерв — отрицательное значение здесь это и выражает. Обрезка до 0
-    # занижала своп ровно на половину недостающего резерва: при sol=0, usdc=$100,
-    # резерве 0.1 SOL ($10) свопалось $50 вместо $55, и после свопа рабочий SOL
-    # был $40 против $50 USDC — перекос $10, из-за которого реоткрытие
-    # получилось бы SOL-ограниченным и часть денег осталась бы лежать зря.
-    net_sol_usd = (sol_balance - min_sol_reserve) * current_price
-    usable_usdc = max(0.0, usdc_balance)
+    return compute_swap_amount(
+        sol_balance=sol_balance,
+        usdc_balance=usdc_balance,
+        current_price=current_price,
+        min_sol_reserve=min_sol_reserve,
+        target_sol_fraction=target_sol_fraction,
+    )
 
-    total_usable_usd = net_sol_usd + usable_usdc
-    if total_usable_usd <= 0:
-        return "NONE", 0.0
 
-    diff_usd = abs(net_sol_usd - usable_usdc)
-    threshold_usd = max(total_usable_usd * 0.02, 1.0)
-    if diff_usd < threshold_usd:
-        return "NONE", 0.0
+async def _target_sol_fraction(
+    ctx,
+    whirlpool,
+    current_price: float,
+    *,
+    dec_a: int | None = None,
+    dec_b: int | None = None,
+) -> float:
+    """
+    Вычисляет целевую долю SOL (по USD) для ребаланса, исходя из ФАКТИЧЕСКОГО
+    диапазона будущей позиции (выровненные tick_lower/tick_upper).
 
-    if net_sol_usd > usable_usdc:
-        swap_usd = (net_sol_usd - usable_usdc) / 2
-        # больше, чем реально свободно сверх резерва, свопнуть нельзя
-        sol_to_swap = min(max(0.0, sol_balance - min_sol_reserve), swap_usd / current_price)
-        if sol_to_swap <= 0:
-            return "NONE", 0.0
-        return "SOL_TO_USDC", sol_to_swap
+    Использует QuoteBuilder.increase_liquidity_by_input_token, чтобы не дублировать
+    математику концентрированной ликвидности вручную.
+    """
+    # ctx сейчас не обязателен для QuoteBuilder, но оставлен в сигнатуре намеренно:
+    # вычисление доли вызывается рядом с on-chain контекстом, и это удобно для future use.
+    _ = ctx
 
-    usdc_to_swap = min(usable_usdc, (usable_usdc - net_sol_usd) / 2)
-    if usdc_to_swap <= 0:
-        return "NONE", 0.0
-    return "USDC_TO_SOL", usdc_to_swap
+    if dec_a is None or dec_b is None:
+        _, dec_a, dec_b, _, _ = await _pool_price_and_decimals(ctx, whirlpool)
+    tick_lower, tick_upper, lower_price, upper_price = _aligned_range_ticks_and_prices(
+        current_price=current_price,
+        whirlpool=whirlpool,
+        decimals_a=dec_a,
+        decimals_b=dec_b,
+    )
+
+    usdc_mint = Pubkey.from_string(USDC_MINT)
+    if whirlpool.token_mint_a == usdc_mint:
+        usdc_decimals = dec_a
+    elif whirlpool.token_mint_b == usdc_mint:
+        usdc_decimals = dec_b
+    else:
+        raise ValueError("Whirlpool не содержит USDC mint — target_sol_fraction невозможен")
+
+    # Пробный ввод: достаточно среднего размера, чтобы не упереться в округления.
+    probe_usdc_units = int(100 * 10**usdc_decimals)  # 100 USDC
+    estimate_slippage = Percentage.from_fraction(1, 100)
+    quote = QuoteBuilder.increase_liquidity_by_input_token(
+        IncreaseLiquidityQuoteParams(
+            input_token_amount=probe_usdc_units,
+            input_token_mint=usdc_mint,
+            token_mint_a=whirlpool.token_mint_a,
+            token_mint_b=whirlpool.token_mint_b,
+            tick_current_index=whirlpool.tick_current_index,
+            sqrt_price=whirlpool.sqrt_price,
+            tick_lower_index=tick_lower,
+            tick_upper_index=tick_upper,
+            slippage_tolerance=estimate_slippage,
+        )
+    )
+    if quote.liquidity <= 0:
+        raise RuntimeError(
+            f"Нулевая ликвидность в оценке target_sol_fraction (range ${lower_price:.4f}-${upper_price:.4f})"
+        )
+
+    est_a = int(getattr(quote, "token_est_a", 0) or 0)
+    est_b = int(getattr(quote, "token_est_b", 0) or 0)
+    if est_a <= 0 and est_b <= 0:
+        est_a = int(getattr(quote, "token_max_a", 0) or 0)
+        est_b = int(getattr(quote, "token_max_b", 0) or 0)
+
+    _, _, sol_usd, usdc_usd, total_usd = _amounts_to_sol_usdc(
+        whirlpool,
+        est_a,
+        est_b,
+        dec_a,
+        dec_b,
+        current_price,
+    )
+    if total_usd <= 0:
+        raise RuntimeError("Нулевой total_usd в оценке target_sol_fraction")
+
+    frac = sol_usd / total_usd
+    if not (0.0 <= frac <= 1.0) or not math.isfinite(frac):
+        raise RuntimeError(f"Некорректная доля SOL в target_sol_fraction: {frac}")
+    return float(frac)
 
 
 async def _swap_to_balance(current_price: float) -> bool:
@@ -1029,46 +1109,8 @@ async def _swap_to_balance(current_price: float) -> bool:
         return False
 
     min_sol_reserve = config.MIN_SOL_BALANCE + config.OPEN_POSITION_RENT_RESERVE_SOL
-    direction, amount_in = _compute_swap_amount(
-        sol_balance=sol_balance,
-        usdc_balance=usdc_balance,
-        current_price=current_price,
-        min_sol_reserve=min_sol_reserve,
-    )
-
-    if direction == "NONE":
-        log.info(
-            "Баланс уже близок к 50/50 (usable): SOL=%.9f (reserve=%.9f) USDC=%.6f price=$%.4f",
-            sol_balance,
-            min_sol_reserve,
-            usdc_balance,
-            current_price,
-        )
-        return True
-
-    if DRY_RUN:
-        if direction == "SOL_TO_USDC":
-            approx_sol = sol_balance - amount_in
-            approx_usdc = usdc_balance + amount_in * current_price
-            log.info(
-                "DRY RUN: swap_to_balance SOL->USDC: amount_in=%.9f SOL, было %.9f SOL / %.6f USDC, стало ~%.9f SOL / ~%.6f USDC",
-                amount_in,
-                sol_balance,
-                usdc_balance,
-                approx_sol,
-                approx_usdc,
-            )
-        else:
-            approx_sol = sol_balance + amount_in / current_price
-            approx_usdc = usdc_balance - amount_in
-            log.info(
-                "DRY RUN: swap_to_balance USDC->SOL: amount_in=%.6f USDC, было %.9f SOL / %.6f USDC, стало ~%.9f SOL / ~%.6f USDC",
-                amount_in,
-                sol_balance,
-                usdc_balance,
-                approx_sol,
-                approx_usdc,
-            )
+    if current_price <= 0:
+        log.warning("swap_to_balance: текущая цена некорректна (<=0), своп пропущен")
         return True
 
     try:
@@ -1080,6 +1122,64 @@ async def _swap_to_balance(current_price: float) -> bool:
             _, dec_a, dec_b, _, _ = await _pool_price_and_decimals(ctx, whirlpool)
             sol_mint = Pubkey.from_string(SOL_MINT)
             usdc_mint = Pubkey.from_string(USDC_MINT)
+
+            try:
+                target_sol_fraction = await _target_sol_fraction(
+                    ctx, whirlpool, current_price, dec_a=dec_a, dec_b=dec_b
+                )
+            except Exception:
+                target_sol_fraction = 0.5
+                log.warning(
+                    "swap_to_balance: не удалось вычислить целевую долю SOL из диапазона — fallback на 0.5",
+                    exc_info=True,
+                )
+
+            direction, amount_in = _compute_swap_amount(
+                sol_balance=sol_balance,
+                usdc_balance=usdc_balance,
+                current_price=current_price,
+                min_sol_reserve=min_sol_reserve,
+                target_sol_fraction=target_sol_fraction,
+            )
+
+            if direction == "NONE":
+                log.info(
+                    "Баланс уже близок к цели (usable): SOL=%.9f (reserve=%.9f) USDC=%.6f "
+                    "price=$%.4f target_sol_fraction=%.3f",
+                    sol_balance,
+                    min_sol_reserve,
+                    usdc_balance,
+                    current_price,
+                    target_sol_fraction,
+                )
+                return True
+
+            if DRY_RUN:
+                if direction == "SOL_TO_USDC":
+                    approx_sol = sol_balance - amount_in
+                    approx_usdc = usdc_balance + amount_in * current_price
+                    log.info(
+                        "DRY RUN: swap_to_balance SOL->USDC: amount_in=%.9f SOL, было %.9f SOL / %.6f USDC, стало ~%.9f SOL / ~%.6f USDC (target_sol_fraction=%.3f)",
+                        amount_in,
+                        sol_balance,
+                        usdc_balance,
+                        approx_sol,
+                        approx_usdc,
+                        target_sol_fraction,
+                    )
+                else:
+                    approx_sol = sol_balance + amount_in / current_price
+                    approx_usdc = usdc_balance - amount_in
+                    log.info(
+                        "DRY RUN: swap_to_balance USDC->SOL: amount_in=%.6f USDC, было %.9f SOL / %.6f USDC, стало ~%.9f SOL / ~%.6f USDC (target_sol_fraction=%.3f)",
+                        amount_in,
+                        sol_balance,
+                        usdc_balance,
+                        approx_sol,
+                        approx_usdc,
+                        target_sol_fraction,
+                    )
+                return True
 
             if (
                 whirlpool.token_mint_a != sol_mint
@@ -1214,7 +1314,8 @@ async def _swap_to_balance(current_price: float) -> bool:
 
             log.info(
                 "Отправляю РЕАЛЬНЫЙ swap_to_balance: dir=%s amount_in_units=%d "
-                "tick_arrays=%s,%s,%s other_amount_threshold=%d sqrt_price_limit=%d",
+                "tick_arrays=%s,%s,%s other_amount_threshold=%d sqrt_price_limit=%d "
+                "target_sol_fraction=%.3f",
                 direction,
                 quote.amount,
                 quote.tick_array_0,
@@ -1222,6 +1323,7 @@ async def _swap_to_balance(current_price: float) -> bool:
                 quote.tick_array_2,
                 quote.other_amount_threshold,
                 quote.sqrt_price_limit,
+                target_sol_fraction,
             )
 
             signature = await tx_builder.build_and_execute()
@@ -1245,7 +1347,7 @@ async def _swap_to_balance(current_price: float) -> bool:
             )
             return True
     except Exception:
-        log.exception("swap_to_balance: ошибка при попытке свопа к 50/50")
+        log.exception("swap_to_balance: ошибка при попытке свопа к целевой доле")
         return False
 
 
@@ -1281,11 +1383,12 @@ async def _compute_reopen_usdc_amount(current_price: float) -> float:
         ctx = await _get_context(client)
         whirlpool = await _load_whirlpool(ctx)
         _, dec_a, dec_b, _, _ = await _pool_price_and_decimals(ctx, whirlpool)
-
-        raw_lower = current_price * (1 - config.RANGE_WIDTH_PCT / 100)
-        raw_upper = current_price * (1 + config.RANGE_WIDTH_PCT / 100)
-        tick_lower = _price_to_tick(raw_lower, dec_a, dec_b, whirlpool.tick_spacing)
-        tick_upper = _price_to_tick(raw_upper, dec_a, dec_b, whirlpool.tick_spacing)
+        tick_lower, tick_upper, lower_price, upper_price = _aligned_range_ticks_and_prices(
+            current_price=current_price,
+            whirlpool=whirlpool,
+            decimals_a=dec_a,
+            decimals_b=dec_b,
+        )
 
         usdc_mint = Pubkey.from_string(USDC_MINT)
         sol_mint = Pubkey.from_string(SOL_MINT)
@@ -1329,8 +1432,8 @@ async def _compute_reopen_usdc_amount(current_price: float) -> float:
             log.warning(
                 "Нулевая ликвидность в оценке реоткрытия (диапазон $%.4f-$%.4f не "
                 "покрывает текущую цену) — реоткрытие отменено",
-                raw_lower,
-                raw_upper,
+                lower_price,
+                upper_price,
             )
             return 0.0
 
@@ -1396,23 +1499,11 @@ async def open_position(
         ctx = await _get_context(client)
         whirlpool = await _load_whirlpool(ctx)
         _, dec_a, dec_b, _, _ = await _pool_price_and_decimals(ctx, whirlpool)
-
-        raw_lower = current_price * (1 - config.RANGE_WIDTH_PCT / 100)
-        raw_upper = current_price * (1 + config.RANGE_WIDTH_PCT / 100)
-        tick_lower = _price_to_tick(raw_lower, dec_a, dec_b, whirlpool.tick_spacing)
-        tick_upper = _price_to_tick(raw_upper, dec_a, dec_b, whirlpool.tick_spacing)
-        # Align range with initializable ticks (rounding can be asymmetric).
-        lower = float(
-            DecimalUtil.to_fixed(
-                PriceMath.tick_index_to_price(tick_lower, dec_a, dec_b),
-                dec_b,
-            )
-        )
-        upper = float(
-            DecimalUtil.to_fixed(
-                PriceMath.tick_index_to_price(tick_upper, dec_a, dec_b),
-                dec_b,
-            )
+        tick_lower, tick_upper, lower, upper = _aligned_range_ticks_and_prices(
+            current_price=current_price,
+            whirlpool=whirlpool,
+            decimals_a=dec_a,
+            decimals_b=dec_b,
         )
 
         if DRY_RUN:
