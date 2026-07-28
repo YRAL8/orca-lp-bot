@@ -8,6 +8,11 @@ WALLET_PRIVATE_KEY=YOUR_PRIVATE_KEY_BASE58
 WHIRLPOOL_ADDRESS=HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ
 POSITION_MINT=YOUR_POSITION_NFT_MINT
 
+# Служебный флаг, бот пишет его сам — руками задавать не нужно.
+# true означает "ребаланс закрыл позицию, но открыть новую не смог, деньги на
+# кошельке" — бот дожимает реоткрытие на следующих тиках, пока не получится.
+REBALANCE_REOPEN_PENDING=false
+
 # Telegram
 TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN
 TELEGRAM_CHAT_ID=YOUR_CHAT_ID

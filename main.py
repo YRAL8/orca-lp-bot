@@ -7,7 +7,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import bot_state
 import config
 import telegram_bot as tg
-from orca import get_position, rebalance, get_current_price
+from orca import get_position, rebalance, get_current_price, reopen_after_failed_rebalance
 from solana_client import get_sol_balance
 from config import (
     POLL_INTERVAL_SEC, REBALANCE_DELAY_MIN,
@@ -149,6 +149,32 @@ async def monitor_position() -> None:
         # Читаем позицию
         position = await get_position()
         if position is None:
+            # Особый случай: предыдущий ребаланс УЖЕ закрыл позицию, но не смог открыть новую.
+            # POSITION_MINT сброшен в плейсхолдер, get_position() вернёт None — это не "потеря
+            # позиции", а ожидаемое состояние, которое нужно дожимать на следующих тиках.
+            if AUTO_REBALANCE and getattr(config, "REBALANCE_REOPEN_PENDING", False):
+                now = datetime.now()
+                try:
+                    current_price = await get_current_price()
+                    new_position = await reopen_after_failed_rebalance(current_price)
+                except Exception as e:
+                    log.exception("Ошибка при попытке reopen pending: %s", e)
+                    new_position = None
+
+                if new_position is not None:
+                    tg.current_position = new_position
+                    await tg.notify_reopen_recovered(new_position)
+                    log.info("Reopen pending успешно завершён — позиция снова открыта")
+                    _reset_rebalance_blocked_state()
+                else:
+                    if _should_send_blocked_reminder(now):
+                        await tg.notify_reopen_pending()
+                        log.error("Reopen pending не удалось — деньги остаются вне пула, повторим позже")
+                        rebalance_blocked_alert_sent = True
+                        rebalance_blocked_last_alert_at = now
+                _reset_rpc_error_state()
+                return
+
             log.error("Не удалось получить позицию")
             # Раньше здесь не было алерта вообще — мониторинг тихо выходил, а
             # heartbeat каждые HEARTBEAT_INTERVAL_HOURS продолжал слать

@@ -181,6 +181,27 @@ async def notify_rebalance_error(error: str) -> None:
     )
 
 
+async def notify_reopen_pending() -> None:
+    """
+    Позиция закрыта, но открыть новую не удалось (reopen pending).
+    Сообщение должно повторяться с rate-limit (логика — в main._should_send_blocked_reminder).
+    """
+    await send_message(
+        "🛑 <b>Деньги вне пула</b>\n"
+        "Позиция была закрыта в ходе ребаланса, но открыть новую не удалось.\n"
+        "Средства сейчас лежат на кошельке вне пула. Я буду пытаться открыть позицию снова."
+    )
+
+
+async def notify_reopen_recovered(position) -> None:
+    """Уведомление: reopen pending успешно восстановлен, позиция снова открыта."""
+    await send_message(
+        "✅ <b>Позиция снова открыта</b>\n"
+        f"Новый диапазон: ${position.lower_price:.2f} — ${position.upper_price:.2f}\n"
+        f"Текущая цена: ${position.current_price:.2f}"
+    )
+
+
 async def notify_low_sol_balance(balance: float) -> None:
     """Уведомление о низком балансе SOL."""
     await send_message(
@@ -892,7 +913,7 @@ async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     проверяет bot_state.bot_frozen — эта команда должна работать даже при /stop
     (аварийный выход нужен именно тогда, когда всё остальное остановлено).
     """
-    from orca import get_position, close_position
+    from orca import get_position, close_position, set_rebalance_reopen_pending
 
     confirmed = bool(context.args) and context.args[0].lower() == "confirm"
 
@@ -917,6 +938,13 @@ async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             parse_mode="HTML",
         )
         return
+
+    # /withdraw — намеренное закрытие. Если до этого висел флаг "reopen pending",
+    # снимаем его, иначе бот начнёт открывать позицию обратно на следующих тиках.
+    try:
+        set_rebalance_reopen_pending(False)
+    except Exception as e:
+        log.exception("Не удалось снять REBALANCE_REOPEN_PENDING при /withdraw: %s", e)
 
     async with bot_state.rebalance_lock:
         try:

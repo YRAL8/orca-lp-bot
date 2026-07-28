@@ -10,7 +10,7 @@ import logging
 from dotenv import find_dotenv, set_key
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, Callable, Awaitable, TypeVar
 
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
@@ -69,6 +69,73 @@ _demo_range: dict | None = None  # lower_price, upper_price, tick_lower, tick_up
 SOL_MINT = "So11111111111111111111111111111111111111112"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 ZERO_SLIPPAGE = Percentage.from_fraction(0, 100)
+
+_REBALANCE_REOPEN_PENDING_ENV_KEY = "REBALANCE_REOPEN_PENDING"
+
+T = TypeVar("T")
+
+
+def set_rebalance_reopen_pending(pending: bool) -> None:
+    """
+    Персистентный флаг: "мы закрыли позицию в ходе ребаланса, но новая не открылась".
+    Храним в .env (смонтирован в docker-compose) через тот же set_key, что и POSITION_MINT.
+
+    ВАЖНО: обновляем и in-memory config, потому что текущий процесс читает именно его.
+    """
+    value = "true" if pending else "false"
+    config.REBALANCE_REOPEN_PENDING = pending
+
+    dotenv_path = find_dotenv()
+    if dotenv_path:
+        set_key(dotenv_path, _REBALANCE_REOPEN_PENDING_ENV_KEY, value, quote_mode="never")
+        log.info("%s сохранён в .env: %s", _REBALANCE_REOPEN_PENDING_ENV_KEY, value)
+    else:
+        log.warning(
+            "Не удалось найти .env файл на диске — %s сохранён только в памяти процесса: %s",
+            _REBALANCE_REOPEN_PENDING_ENV_KEY,
+            value,
+        )
+
+
+async def _call_with_retry(
+    coro_factory: Callable[[], Awaitable[T]],
+    *,
+    what: str,
+    retries: int = 4,
+    base_delay: float = 1.5,
+) -> T:
+    """
+    Универсальный retry+экспоненциальный backoff для нестабильных RPC/сети.
+
+    Принимает ФАБРИКУ корутины (lambda), а не корутину: корутину нельзя
+    переиспользовать после await/ошибки.
+    """
+    if not callable(coro_factory):
+        raise TypeError("coro_factory должен быть callable, возвращающим новую корутину на каждую попытку")
+    if retries <= 0:
+        raise ValueError("retries должен быть > 0")
+    if base_delay <= 0:
+        raise ValueError("base_delay должен быть > 0")
+
+    last_error: Exception | None = None
+    for attempt in range(retries):
+        try:
+            return await coro_factory()
+        except Exception as e:
+            last_error = e
+            if attempt < retries - 1:
+                delay = base_delay * (2 ** attempt)
+                log.warning(
+                    "%s не удалось (попытка %d/%d): %s — повтор через %.1fс",
+                    what,
+                    attempt + 1,
+                    retries,
+                    e,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+    assert last_error is not None
+    raise last_error
 
 
 @dataclass
@@ -1318,7 +1385,13 @@ async def _compute_reopen_usdc_amount(current_price: float) -> float:
         return max(0.0, usdc_amount_by_sol_limit * _REOPEN_SAFETY_HAIRCUT)
 
 
-async def open_position(current_price: float, usdc_amount: Optional[float] = None) -> Optional[Position]:
+async def open_position(
+    current_price: float,
+    usdc_amount: Optional[float] = None,
+    *,
+    position_mint_keypair: Keypair | None = None,
+) -> Optional[Position]:
+    global POSITION_MINT
     async with get_client() as client:
         ctx = await _get_context(client)
         whirlpool = await _load_whirlpool(ctx)
@@ -1432,7 +1505,7 @@ async def open_position(current_price: float, usdc_amount: Optional[float] = Non
         else:
             raise ValueError("Whirlpool не содержит SOL mint, wrapped SOL счёт не может быть создан")
 
-        position_mint_keypair = Keypair()
+        position_mint_keypair = position_mint_keypair or Keypair()
         position_mint = position_mint_keypair.pubkey()
         position_pda = PDAUtil.get_position(ORCA_WHIRLPOOL_PROGRAM_ID, position_mint)
         # Открываем БЕЗ Metaplex-metadata (open_position, не open_position_with_metadata) —
@@ -1467,6 +1540,35 @@ async def open_position(current_price: float, usdc_amount: Optional[float] = Non
         # была бы дублирующей — нашёл независимый аудит (Grok 4.5) 2026-07-26, подтвердил
         # чтением исходников.
         position_token_account = TokenUtil.derive_ata(wallet_pubkey, position_mint)
+
+        # Безопасность повторов: build_and_execute() может упасть как ДО отправки (например,
+        # get_latest_blockhash=429), так и ПОСЛЕ send_raw_transaction (например,
+        # confirm_transaction/сеть). Если мы повторим open_position, генерируя новый mint,
+        # можно открыть ДВЕ позиции. Поэтому при повторных попытках ребаланса используем
+        # один и тот же position_mint_keypair, и прежде чем пытаться отправлять заново —
+        # проверяем, не появилась ли позиция on-chain.
+        existing = await ctx.fetcher.get_position(position_pda.pubkey)
+        if existing is not None:
+            log.warning(
+                "open_position: позиция уже существует on-chain для mint=%s — восстановим состояние без повторной отправки",
+                position_mint,
+            )
+            new_mint_str = str(position_mint)
+            POSITION_MINT = new_mint_str
+            config.POSITION_MINT = new_mint_str
+
+            dotenv_path = find_dotenv()
+            if dotenv_path:
+                set_key(dotenv_path, "POSITION_MINT", new_mint_str, quote_mode="never")
+                log.info("POSITION_MINT сохранён в .env: %s", new_mint_str)
+            else:
+                log.warning(
+                    "Не удалось найти .env файл на диске — POSITION_MINT сохранён только в памяти процесса: %s",
+                    new_mint_str,
+                )
+
+            set_rebalance_reopen_pending(False)
+            return await get_position()
 
         lower_start_tick = TickUtil.get_start_tick_index(tick_lower, whirlpool.tick_spacing)
         upper_start_tick = TickUtil.get_start_tick_index(tick_upper, whirlpool.tick_spacing)
@@ -1624,7 +1726,6 @@ async def open_position(current_price: float, usdc_amount: Optional[float] = Non
         # думать, что активна старая (уже закрытая) позиция (поймано вживую через
         # /rebalance на сервере, 2026-07-26).
         new_mint_str = str(position_mint)
-        global POSITION_MINT
         POSITION_MINT = new_mint_str
         config.POSITION_MINT = new_mint_str
 
@@ -1638,6 +1739,8 @@ async def open_position(current_price: float, usdc_amount: Optional[float] = Non
                 "POSITION_MINT сохранён только в памяти процесса, не в файле: %s",
                 new_mint_str,
             )
+
+        set_rebalance_reopen_pending(False)
 
         position = Position(
             mint=str(position_mint),
@@ -1963,19 +2066,39 @@ async def rebalance(position: Position) -> Optional[Position]:
         log.error("Не удалось закрыть позицию")
         return None
 
+    # Теперь денег в пуле уже нет: любой сбой дальше оставляет капитал на кошельке.
+    # Ставим персистентный флаг "нужно дожать реоткрытие" и снимаем его только
+    # после успешного open_position().
+    # В DRY_RUN не трогаем: там close/open ничего не делают, а open_position
+    # возвращается раньше строки, снимающей флаг — то есть холостой прогон
+    # оставил бы в .env вечный REBALANCE_REOPEN_PENDING=true. Холостой режим
+    # вообще не должен писать состояние на диск.
+    if not DRY_RUN:
+        set_rebalance_reopen_pending(True)
+
     current_price = await get_current_price()
 
     try:
-        if not await _swap_to_balance(current_price):
-            log.error("Не удалось сбалансировать кошелёк свопом перед реоткрытием")
-            return None
+        async def _swap_required():
+            ok = await _swap_to_balance(current_price)
+            if not ok:
+                raise RuntimeError("swap_to_balance вернул False")
+            return True
+
+        await _call_with_retry(
+            _swap_required,
+            what="swap_to_balance перед реоткрытием",
+        )
     except Exception:
         log.exception("Сбой при балансирующем свопе перед реоткрытием")
         return None
 
     usdc_amount = None
     if not DRY_RUN:
-        usdc_amount = await _compute_reopen_usdc_amount(current_price)
+        usdc_amount = await _call_with_retry(
+            lambda: _compute_reopen_usdc_amount(current_price),
+            what="compute_reopen_usdc_amount",
+        )
         log.info(
             "Пересчитанная сумма для реоткрытия: %.6f USDC (по факту доступного баланса)",
             usdc_amount,
@@ -1984,11 +2107,74 @@ async def rebalance(position: Position) -> Optional[Position]:
             log.error("Недостаточно средств для реоткрытия позиции после ребаланса")
             return None
 
-    new_position = await open_position(current_price, usdc_amount=usdc_amount)
+    # Безопасность: используем один и тот же position_mint между попытками, чтобы
+    # повтор open_position не открыл две разные позиции.
+    reopen_mint = Keypair() if not DRY_RUN else None
+    new_position = await _call_with_retry(
+        lambda: open_position(
+            current_price,
+            usdc_amount=usdc_amount,
+            position_mint_keypair=reopen_mint,
+        ),
+        what="open_position после close_position",
+    )
     if new_position is None:
         log.error("Не удалось открыть новую позицию")
         return None
 
     new_position.is_demo = position.is_demo
     log.info("Ребаланс завершён успешно")
+    return new_position
+
+
+async def reopen_after_failed_rebalance(current_price: float) -> Optional[Position]:
+    """
+    Дожимает состояние "позиция закрыта в ребалансе, но открыть новую не вышло".
+    Вызывается из monitor_position() на следующих тиках.
+    """
+    log.info("Пробуем реоткрыть позицию после неудачного ребаланса...")
+
+    try:
+        async def _swap_required():
+            ok = await _swap_to_balance(current_price)
+            if not ok:
+                raise RuntimeError("swap_to_balance вернул False")
+            return True
+
+        await _call_with_retry(
+            _swap_required,
+            what="swap_to_balance перед повторным реоткрытием",
+        )
+    except Exception:
+        log.exception("Сбой при балансирующем свопе перед повторным реоткрытием")
+        return None
+
+    usdc_amount = None
+    if not DRY_RUN:
+        try:
+            usdc_amount = await _call_with_retry(
+                lambda: _compute_reopen_usdc_amount(current_price),
+                what="compute_reopen_usdc_amount (reopen pending)",
+            )
+        except Exception:
+            log.exception("Сбой при вычислении суммы реоткрытия (reopen pending)")
+            return None
+        if usdc_amount <= 0:
+            log.error("Недостаточно средств для реоткрытия позиции (reopen pending)")
+            return None
+
+    reopen_mint = Keypair() if not DRY_RUN else None
+    try:
+        new_position = await _call_with_retry(
+            lambda: open_position(
+                current_price,
+                usdc_amount=usdc_amount,
+                position_mint_keypair=reopen_mint,
+            ),
+            what="open_position (reopen pending)",
+        )
+    except Exception:
+        log.exception("open_position не удался при reopen pending")
+        return None
+
     return new_position

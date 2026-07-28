@@ -12,6 +12,7 @@ WALLET_PRIVATE_KEY = os.getenv("WALLET_PRIVATE_KEY", "").strip()
 # Orca
 WHIRLPOOL_ADDRESS = os.getenv("WHIRLPOOL_ADDRESS", "").strip()
 POSITION_MINT = os.getenv("POSITION_MINT", "").strip()
+REBALANCE_REOPEN_PENDING = os.getenv("REBALANCE_REOPEN_PENDING", "false").lower() == "true"
 
 # Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
