@@ -4,6 +4,7 @@ import logging.handlers
 from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+import bot_state
 import config
 import telegram_bot as tg
 from orca import get_position, rebalance, get_current_price
@@ -45,7 +46,6 @@ log = logging.getLogger(__name__)
 # один close/open прошёл. asyncio.Lock здесь оставлен как более надёжный примитив
 # взамен bool-флага (не полагается на порядок await), а не как фикс подтверждённого
 # бага.
-_rebalance_lock = asyncio.Lock()
 
 # Время когда цена первый раз вышла за границу
 out_of_range_since: datetime = None
@@ -71,12 +71,6 @@ rpc_error_streak = 0
 # Анти-спам: уже отправляли алерт "RPC недоступен" для текущей серии ошибок?
 rpc_down_alert_sent = False
 
-# /pauza — авто-цикл (monitor_position) стоит, ручные команды (/rebalance,
-# /addliquidity) по-прежнему работают. /stop — полная заморозка, ручные команды
-# денежных действий тоже отключены. /boevoy снимает оба разом.
-bot_paused = False
-bot_frozen = False
-
 
 def _reset_rpc_error_state() -> None:
     """Сбрасывает состояние RPC-ошибок после успешного тика мониторинга."""
@@ -92,14 +86,14 @@ async def monitor_position() -> None:
     """
     global out_of_range_since, stale_alert_sent, low_sol_alert_sent, rpc_error_streak, rpc_down_alert_sent, position_lost_alert_sent
 
-    if bot_paused or bot_frozen:
+    if bot_state.bot_paused or bot_state.bot_frozen:
         log.info("Бот на паузе/заморожен (/pauza, /stop) — пропускаем тик мониторинга")
         return
 
     # Если уже идёт ребаланс — пропускаем. Проверка + вход в lock ниже идут без await
     # между ними, так что в однопоточном asyncio-цикле это безопасно (в отличие от
     # прежнего bool-флага, выставлявшегося только в конце после нескольких await).
-    if _rebalance_lock.locked():
+    if bot_state.rebalance_lock.locked():
         log.info("Ребаланс в процессе, пропускаем мониторинг")
         return
 
@@ -224,7 +218,7 @@ async def monitor_position() -> None:
         # Делаем ребаланс
         out_of_range_since = None
 
-        async with _rebalance_lock:
+        async with bot_state.rebalance_lock:
             try:
                 # Перечитываем позицию свежо, ВНУТРИ лока — `position` наверху этой
                 # функции могла устареть: между тем чтением и этим моментом было

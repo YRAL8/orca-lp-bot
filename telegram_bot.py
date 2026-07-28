@@ -15,6 +15,8 @@ from config import (
 )
 from solana_client import get_sol_balance, get_usdc_balance
 
+import bot_state
+
 log = logging.getLogger(__name__)
 
 # Глобальная ссылка на текущую позицию (обновляется из main.py)
@@ -498,18 +500,13 @@ async def rebalance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     """
     global current_position
 
-    # main._rebalance_lock — тот же лок, что и у автоматического ребаланса в
-    # monitor_position(). Импорт внутри функции (не на уровне модуля) — main.py уже
-    # импортирует telegram_bot как tg, импорт в обратную сторону на уровне модуля
-    # был бы циклическим.
-    import main
     from orca import get_position, rebalance
 
-    if main.bot_frozen:
+    if bot_state.bot_frozen:
         await _reply(update, context, "🛑 Бот заморожен (/stop) — сначала /boevoy.")
         return
 
-    if main._rebalance_lock.locked():
+    if bot_state.rebalance_lock.locked():
         await _reply(update, context, "⏳ Ребаланс уже выполняется — подожди.")
         return
 
@@ -519,7 +516,7 @@ async def rebalance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     # объект позиции. Не риск для денег (текущий владелец лока отработал бы
     # корректно), но давало непонятную "❌ Ошибка ребаланса" на стороне проигравшего
     # (найдено как M1, 2026-07-27).
-    async with main._rebalance_lock:
+    async with bot_state.rebalance_lock:
         try:
             position = await get_position()
         except Exception as e:
@@ -559,13 +556,11 @@ async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     import config
     from orca import get_position, open_position, get_current_price
 
-    import main
-
-    if main.bot_frozen:
+    if bot_state.bot_frozen:
         await _reply(update, context, "🛑 Бот заморожен (/stop) — сначала /boevoy.")
         return
 
-    if main._rebalance_lock.locked():
+    if bot_state.rebalance_lock.locked():
         await _reply(update, context, "⏳ Идёт ребаланс/открытие — подожди.")
         return
 
@@ -588,7 +583,7 @@ async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await _reply(update, context, "❌ Сумма должна быть больше 0.")
         return
 
-    async with main._rebalance_lock:
+    async with bot_state.rebalance_lock:
         try:
             existing = await get_position()
         except Exception as e:
@@ -674,13 +669,11 @@ async def addliquidity_command(update: Update, context: ContextTypes.DEFAULT_TYP
     # Тот же лок, что и у /rebalance и автоматического ребаланса — доливка во время
     # close/reopen целилась бы в position_pda, которого в этот момент может уже не быть
     # (или ещё не быть) on-chain.
-    import main
-
-    if main.bot_frozen:
+    if bot_state.bot_frozen:
         await _reply(update, context, "🛑 Бот заморожен (/stop) — сначала /boevoy.")
         return
 
-    if main._rebalance_lock.locked():
+    if bot_state.rebalance_lock.locked():
         await _reply(update, context, "⏳ Идёт ребаланс — подожди, потом долей.")
         return
 
@@ -720,7 +713,7 @@ async def addliquidity_command(update: Update, context: ContextTypes.DEFAULT_TYP
             await _reply(update, context, "❌ Сумма должна быть больше 0.")
             return
 
-    async with main._rebalance_lock:
+    async with bot_state.rebalance_lock:
         try:
             position = await get_position()
         except Exception as e:
@@ -812,9 +805,7 @@ async def addliquidity_command(update: Update, context: ContextTypes.DEFAULT_TYP
 async def pauza_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/pauza — останавливает только автоматический цикл (monitor_position);
     ручные команды (/rebalance, /addliquidity) по-прежнему работают."""
-    import main
-
-    main.bot_paused = True
+    bot_state.bot_paused = True
     await _reply(
         update,
         context,
@@ -826,9 +817,7 @@ async def pauza_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/stop — полная заморозка: и автоматика, и денежные ручные команды отключены."""
-    import main
-
-    main.bot_frozen = True
+    bot_state.bot_frozen = True
     await _reply(
         update,
         context,
@@ -839,10 +828,8 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def boevoy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/boevoy — снимает разом /pauza и /stop, полный боевой режим."""
-    import main
-
-    main.bot_paused = False
-    main.bot_frozen = False
+    bot_state.bot_paused = False
+    bot_state.bot_frozen = False
     await _reply(
         update,
         context,
@@ -862,12 +849,11 @@ async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     сохранённое между сообщениями состояние — /withdraw confirm всегда читает
     свежие данные заново, без риска зависшего "ожидания" от предыдущего сообщения.
 
-    Берёт main._rebalance_lock на время закрытия (не гонять close_position
+    Берёт bot_state.rebalance_lock на время закрытия (не гонять close_position
     параллельно с автоматическим/ручным ребалансом той же позиции), но намеренно НЕ
-    проверяет main.bot_frozen — эта команда должна работать даже при /stop
+    проверяет bot_state.bot_frozen — эта команда должна работать даже при /stop
     (аварийный выход нужен именно тогда, когда всё остальное остановлено).
     """
-    import main
     from orca import get_position, close_position
 
     confirmed = bool(context.args) and context.args[0].lower() == "confirm"
@@ -894,7 +880,7 @@ async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
 
-    async with main._rebalance_lock:
+    async with bot_state.rebalance_lock:
         try:
             await _reply(update, context, "🔒 Закрываю позицию...")
             closed = await close_position(position)
