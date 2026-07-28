@@ -16,14 +16,15 @@ from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solana.rpc.async_api import AsyncClient
 
-from orca_whirlpool.constants import ORCA_WHIRLPOOL_PROGRAM_ID
+from orca_whirlpool.constants import ORCA_WHIRLPOOL_PROGRAM_ID, MIN_SQRT_PRICE, MAX_SQRT_PRICE
 from orca_whirlpool.context import WhirlpoolContext
-from orca_whirlpool.internal.types.enums import PositionStatus
+from orca_whirlpool.internal.types.enums import PositionStatus, SwapDirection, SpecifiedAmount
 from orca_whirlpool.quote import (
     QuoteBuilder,
     CollectFeesQuoteParams,
     DecreaseLiquidityQuoteParams,
     IncreaseLiquidityQuoteParams,
+    SwapQuoteParams,
 )
 from orca_whirlpool.types import Percentage
 from orca_whirlpool.utils import (
@@ -46,6 +47,7 @@ from orca_whirlpool.instruction import (
     CollectFeesParams,
     CollectRewardParams,
     UpdateFeesAndRewardsParams,
+    SwapParams,
 )
 import config
 from config import (
@@ -901,6 +903,285 @@ async def close_position(position: Position) -> bool:
 _REOPEN_SAFETY_HAIRCUT = 0.98  # 2%
 
 
+def _compute_swap_amount(
+    sol_balance: float,
+    usdc_balance: float,
+    current_price: float,
+    min_sol_reserve: float,
+) -> tuple[str, float]:
+    """
+    Чистая арифметика: определяет, нужно ли свопнуть кошелёк к 50/50 (по USD)
+    перед реоткрытием, и сколько именно.
+
+    Возвращает (direction, amount):
+    - direction: "SOL_TO_USDC", "USDC_TO_SOL" или "NONE"
+    - amount: сумма входного токена в его натуральных единицах (SOL или USDC)
+    """
+    if current_price <= 0:
+        return "NONE", 0.0
+
+    # ВАЖНО: net_sol_usd намеренно НЕ обрезается снизу нулём. Если SOL меньше
+    # резерва (типично после выхода цены ВВЕРХ: позиция закрылась в 100% USDC,
+    # а SOL ушёл на газ), то нам нужно докупить SOL не только до половины, но и
+    # на сам резерв — отрицательное значение здесь это и выражает. Обрезка до 0
+    # занижала своп ровно на половину недостающего резерва: при sol=0, usdc=$100,
+    # резерве 0.1 SOL ($10) свопалось $50 вместо $55, и после свопа рабочий SOL
+    # был $40 против $50 USDC — перекос $10, из-за которого реоткрытие
+    # получилось бы SOL-ограниченным и часть денег осталась бы лежать зря.
+    net_sol_usd = (sol_balance - min_sol_reserve) * current_price
+    usable_usdc = max(0.0, usdc_balance)
+
+    total_usable_usd = net_sol_usd + usable_usdc
+    if total_usable_usd <= 0:
+        return "NONE", 0.0
+
+    diff_usd = abs(net_sol_usd - usable_usdc)
+    threshold_usd = max(total_usable_usd * 0.02, 1.0)
+    if diff_usd < threshold_usd:
+        return "NONE", 0.0
+
+    if net_sol_usd > usable_usdc:
+        swap_usd = (net_sol_usd - usable_usdc) / 2
+        # больше, чем реально свободно сверх резерва, свопнуть нельзя
+        sol_to_swap = min(max(0.0, sol_balance - min_sol_reserve), swap_usd / current_price)
+        if sol_to_swap <= 0:
+            return "NONE", 0.0
+        return "SOL_TO_USDC", sol_to_swap
+
+    usdc_to_swap = min(usable_usdc, (usable_usdc - net_sol_usd) / 2)
+    if usdc_to_swap <= 0:
+        return "NONE", 0.0
+    return "USDC_TO_SOL", usdc_to_swap
+
+
+async def _swap_to_balance(current_price: float) -> bool:
+    sol_balance = await get_sol_balance()
+    usdc_balance = await get_usdc_balance()
+    if sol_balance is None or usdc_balance is None:
+        log.warning("Кошелёк не настроен: невозможно выполнить балансирующий своп")
+        return False
+
+    min_sol_reserve = config.MIN_SOL_BALANCE + config.OPEN_POSITION_RENT_RESERVE_SOL
+    direction, amount_in = _compute_swap_amount(
+        sol_balance=sol_balance,
+        usdc_balance=usdc_balance,
+        current_price=current_price,
+        min_sol_reserve=min_sol_reserve,
+    )
+
+    if direction == "NONE":
+        log.info(
+            "Баланс уже близок к 50/50 (usable): SOL=%.9f (reserve=%.9f) USDC=%.6f price=$%.4f",
+            sol_balance,
+            min_sol_reserve,
+            usdc_balance,
+            current_price,
+        )
+        return True
+
+    if DRY_RUN:
+        if direction == "SOL_TO_USDC":
+            approx_sol = sol_balance - amount_in
+            approx_usdc = usdc_balance + amount_in * current_price
+            log.info(
+                "DRY RUN: swap_to_balance SOL->USDC: amount_in=%.9f SOL, было %.9f SOL / %.6f USDC, стало ~%.9f SOL / ~%.6f USDC",
+                amount_in,
+                sol_balance,
+                usdc_balance,
+                approx_sol,
+                approx_usdc,
+            )
+        else:
+            approx_sol = sol_balance + amount_in / current_price
+            approx_usdc = usdc_balance - amount_in
+            log.info(
+                "DRY RUN: swap_to_balance USDC->SOL: amount_in=%.6f USDC, было %.9f SOL / %.6f USDC, стало ~%.9f SOL / ~%.6f USDC",
+                amount_in,
+                sol_balance,
+                usdc_balance,
+                approx_sol,
+                approx_usdc,
+            )
+        return True
+
+    try:
+        async with get_client() as client:
+            ctx = await _get_context(client)
+            whirlpool = await _load_whirlpool(ctx)
+            whirlpool_pubkey = Pubkey.from_string(WHIRLPOOL_ADDRESS)
+
+            _, dec_a, dec_b, _, _ = await _pool_price_and_decimals(ctx, whirlpool)
+            sol_mint = Pubkey.from_string(SOL_MINT)
+            usdc_mint = Pubkey.from_string(USDC_MINT)
+
+            if (
+                whirlpool.token_mint_a != sol_mint
+                and whirlpool.token_mint_b != sol_mint
+                or whirlpool.token_mint_a != usdc_mint
+                and whirlpool.token_mint_b != usdc_mint
+            ):
+                raise ValueError("Whirlpool не содержит SOL/USDC mint — swap_to_balance невозможен")
+
+            if direction == "SOL_TO_USDC":
+                if amount_in <= 0:
+                    return True
+                amount_in_units = round(amount_in * 1_000_000_000)
+                if whirlpool.token_mint_a == sol_mint and whirlpool.token_mint_b == usdc_mint:
+                    swap_direction = SwapDirection.AtoB
+                elif whirlpool.token_mint_b == sol_mint and whirlpool.token_mint_a == usdc_mint:
+                    swap_direction = SwapDirection.BtoA
+                else:
+                    raise ValueError("Неожиданное соответствие mint'ов для SOL->USDC")
+            else:
+                if amount_in <= 0:
+                    return True
+                usdc_decimals = dec_a if whirlpool.token_mint_a == usdc_mint else dec_b
+                amount_in_units = round(amount_in * 10**usdc_decimals)
+                if whirlpool.token_mint_a == usdc_mint and whirlpool.token_mint_b == sol_mint:
+                    swap_direction = SwapDirection.AtoB
+                elif whirlpool.token_mint_b == usdc_mint and whirlpool.token_mint_a == sol_mint:
+                    swap_direction = SwapDirection.BtoA
+                else:
+                    raise ValueError("Неожиданное соответствие mint'ов для USDC->SOL")
+
+            a_to_b = swap_direction == SwapDirection.AtoB
+            start_tick_0 = TickUtil.get_start_tick_index(whirlpool.tick_current_index, whirlpool.tick_spacing, offset=0)
+            start_tick_1 = TickUtil.get_start_tick_index(
+                whirlpool.tick_current_index,
+                whirlpool.tick_spacing,
+                offset=-1 if a_to_b else 1,
+            )
+            start_tick_2 = TickUtil.get_start_tick_index(
+                whirlpool.tick_current_index,
+                whirlpool.tick_spacing,
+                offset=-2 if a_to_b else 2,
+            )
+
+            tick_array_pda_0 = PDAUtil.get_tick_array(ORCA_WHIRLPOOL_PROGRAM_ID, whirlpool_pubkey, start_tick_0)
+            tick_array_pda_1 = PDAUtil.get_tick_array(ORCA_WHIRLPOOL_PROGRAM_ID, whirlpool_pubkey, start_tick_1)
+            tick_array_pda_2 = PDAUtil.get_tick_array(ORCA_WHIRLPOOL_PROGRAM_ID, whirlpool_pubkey, start_tick_2)
+
+            tick_array_0 = await ctx.fetcher.get_tick_array(tick_array_pda_0.pubkey)
+            tick_array_1 = await ctx.fetcher.get_tick_array(tick_array_pda_1.pubkey)
+            tick_array_2 = await ctx.fetcher.get_tick_array(tick_array_pda_2.pubkey)
+
+            if tick_array_0 is None or tick_array_1 is None or tick_array_2 is None:
+                log.error(
+                    "swap_to_balance: tick_arrays не инициализированы/не найдены: %s=%s %s=%s %s=%s",
+                    start_tick_0,
+                    tick_array_pda_0.pubkey,
+                    start_tick_1,
+                    tick_array_pda_1.pubkey,
+                    start_tick_2,
+                    tick_array_pda_2.pubkey,
+                )
+                return False
+
+            slippage = Percentage.from_fraction(1, 100)
+            sqrt_price_limit = MIN_SQRT_PRICE if a_to_b else MAX_SQRT_PRICE
+            quote = QuoteBuilder.swap(
+                SwapQuoteParams(
+                    whirlpool=whirlpool,
+                    amount=amount_in_units,
+                    other_amount_threshold=0,
+                    sqrt_price_limit=sqrt_price_limit,
+                    direction=swap_direction,
+                    specified_amount=SpecifiedAmount.SwapInput,
+                    tick_arrays=[tick_array_0, tick_array_1, tick_array_2],
+                    slippage_tolerance=slippage,
+                )
+            )
+
+            wallet = get_wallet_keypair()
+            wallet_pubkey = wallet.pubkey()
+
+            input_is_sol = (
+                (a_to_b and whirlpool.token_mint_a == sol_mint)
+                or (not a_to_b and whirlpool.token_mint_b == sol_mint)
+            )
+            token_owner_a = await TokenUtil.resolve_or_create_ata(
+                client,
+                wallet_pubkey,
+                whirlpool.token_mint_a,
+                wrapped_sol_amount=quote.amount if input_is_sol and whirlpool.token_mint_a == sol_mint else 0,
+                funder=wallet_pubkey,
+                idempotent=True,
+            )
+            token_owner_b = await TokenUtil.resolve_or_create_ata(
+                client,
+                wallet_pubkey,
+                whirlpool.token_mint_b,
+                wrapped_sol_amount=quote.amount if input_is_sol and whirlpool.token_mint_b == sol_mint else 0,
+                funder=wallet_pubkey,
+                idempotent=True,
+            )
+
+            oracle_pda = PDAUtil.get_oracle(ORCA_WHIRLPOOL_PROGRAM_ID, whirlpool_pubkey)
+            swap_ix = WhirlpoolIx.swap(
+                ORCA_WHIRLPOOL_PROGRAM_ID,
+                SwapParams(
+                    amount=quote.amount,
+                    other_amount_threshold=quote.other_amount_threshold,
+                    sqrt_price_limit=quote.sqrt_price_limit,
+                    amount_specified_is_input=True,
+                    a_to_b=a_to_b,
+                    token_authority=wallet_pubkey,
+                    whirlpool=whirlpool_pubkey,
+                    token_owner_account_a=token_owner_a.pubkey,
+                    token_vault_a=whirlpool.token_vault_a,
+                    token_owner_account_b=token_owner_b.pubkey,
+                    token_vault_b=whirlpool.token_vault_b,
+                    tick_array_0=quote.tick_array_0,
+                    tick_array_1=quote.tick_array_1,
+                    tick_array_2=quote.tick_array_2,
+                    oracle=oracle_pda.pubkey,
+                ),
+            )
+
+            tx_builder = TransactionBuilder(client, wallet)
+            tx_builder.set_compute_unit_limit(400_000)
+            tx_builder.set_compute_unit_price(config.PRIORITY_FEE_MICROLAMPORTS)
+            tx_builder.add_instruction(token_owner_a.instruction)
+            tx_builder.add_instruction(token_owner_b.instruction)
+            tx_builder.add_instruction(swap_ix)
+
+            log.info(
+                "Отправляю РЕАЛЬНЫЙ swap_to_balance: dir=%s amount_in_units=%d "
+                "tick_arrays=%s,%s,%s other_amount_threshold=%d sqrt_price_limit=%d",
+                direction,
+                quote.amount,
+                quote.tick_array_0,
+                quote.tick_array_1,
+                quote.tick_array_2,
+                quote.other_amount_threshold,
+                quote.sqrt_price_limit,
+            )
+
+            signature = await tx_builder.build_and_execute()
+            status_resp = await _get_signature_status_with_retry(client, signature)
+            status = status_resp.value[0]
+            if status is None or status.err is not None:
+                raise RuntimeError(
+                    f"Транзакция swap_to_balance не удалась on-chain: signature={signature} "
+                    f"err={status.err if status else 'нет статуса'}"
+                )
+
+            post_sol = await get_sol_balance()
+            post_usdc = await get_usdc_balance()
+            log.info(
+                "swap_to_balance успешно отправлена и подтверждена: %s; было %.9f SOL / %.6f USDC, стало %.9f SOL / %.6f USDC",
+                signature,
+                sol_balance,
+                usdc_balance,
+                post_sol if post_sol is not None else -1.0,
+                post_usdc if post_usdc is not None else -1.0,
+            )
+            return True
+    except Exception:
+        log.exception("swap_to_balance: ошибка при попытке свопа к 50/50")
+        return False
+
+
 async def _compute_reopen_usdc_amount(current_price: float) -> float:
     sol_balance = await get_sol_balance()
     usdc_balance = await get_usdc_balance()
@@ -1683,6 +1964,14 @@ async def rebalance(position: Position) -> Optional[Position]:
         return None
 
     current_price = await get_current_price()
+
+    try:
+        if not await _swap_to_balance(current_price):
+            log.error("Не удалось сбалансировать кошелёк свопом перед реоткрытием")
+            return None
+    except Exception:
+        log.exception("Сбой при балансирующем свопе перед реоткрытием")
+        return None
 
     usdc_amount = None
     if not DRY_RUN:
