@@ -58,6 +58,12 @@ stale_alert_sent = False
 # пока баланс не вернётся выше MIN_SOL_BALANCE.
 low_sol_alert_sent = False
 
+# В случае, когда цена вне диапазона и авто-ребаланс реально заблокирован
+# недостатком SOL — отправляем отдельный тревожный алерт с rate-limit.
+REBALANCE_BLOCKED_REMINDER_HOURS = 1
+rebalance_blocked_alert_sent = False
+rebalance_blocked_last_alert_at: datetime = None
+
 # Уже отправили алерт "позиция не найдена on-chain"? Чтобы не повторять
 # каждые POLL_INTERVAL_SEC, пока позиция не найдётся снова.
 position_lost_alert_sent = False
@@ -79,12 +85,39 @@ def _reset_rpc_error_state() -> None:
     rpc_down_alert_sent = False
 
 
+def _reset_rebalance_blocked_state() -> None:
+    """Сбрасывает анти-спам состояние критического алерта о заблокированном ребалансе."""
+    global rebalance_blocked_alert_sent, rebalance_blocked_last_alert_at
+    rebalance_blocked_alert_sent = False
+    rebalance_blocked_last_alert_at = None
+
+
+def _should_send_blocked_reminder(now: datetime) -> bool:
+    """Пора ли напомнить, что позиция вне диапазона и ребаланс не происходит.
+
+    Первый раз — сразу, дальше не чаще REBALANCE_BLOCKED_REMINDER_HOURS. Общая
+    логика для обеих причин "вне диапазона, но ничего не делается": не хватает
+    SOL на газ (AUTO_REBALANCE=true) и ожидание ручного вмешательства
+    (AUTO_REBALANCE=false). Одноразовый алерт для таких состояний не годится —
+    именно так был пропущен ночной инцидент 2026-07-28.
+    """
+    if not rebalance_blocked_alert_sent:
+        return True
+    # Флаг есть, а времени нет — неконсистентное состояние, лучше сообщить.
+    if rebalance_blocked_last_alert_at is None:
+        return True
+    hours_since = (now - rebalance_blocked_last_alert_at).total_seconds() / 3600
+    return hours_since >= REBALANCE_BLOCKED_REMINDER_HOURS
+
+
 async def monitor_position() -> None:
     """
     Основной цикл мониторинга.
     Запускается каждые POLL_INTERVAL_SEC секунд.
     """
-    global out_of_range_since, stale_alert_sent, low_sol_alert_sent, rpc_error_streak, rpc_down_alert_sent, position_lost_alert_sent
+    global out_of_range_since, stale_alert_sent, low_sol_alert_sent
+    global rebalance_blocked_alert_sent, rebalance_blocked_last_alert_at
+    global rpc_error_streak, rpc_down_alert_sent, position_lost_alert_sent
 
     if bot_state.bot_paused or bot_state.bot_frozen:
         log.info("Бот на паузе/заморожен (/pauza, /stop) — пропускаем тик мониторинга")
@@ -109,6 +142,9 @@ async def monitor_position() -> None:
                     low_sol_alert_sent = True
             else:
                 low_sol_alert_sent = False
+                # SOL снова хватает — если ранее ребаланс был заблокирован, сбрасываем состояние,
+                # чтобы следующий инцидент снова дал немедленный тревожный алерт.
+                _reset_rebalance_blocked_state()
 
         # Читаем позицию
         position = await get_position()
@@ -156,6 +192,7 @@ async def monitor_position() -> None:
                 log.info("Цена вернулась в диапазон")
             out_of_range_since = None
             stale_alert_sent = False
+            _reset_rebalance_blocked_state()
             _reset_rpc_error_state()
             return
 
@@ -180,13 +217,17 @@ async def monitor_position() -> None:
             return
 
         if not AUTO_REBALANCE:
-            # Только наблюдение: сообщаем один раз, что пора вмешаться вручную,
-            # и молчим дальше, пока цена сама не вернётся в диапазон (см. выше).
-            # Реальный ребаланс (close/open позиции) ещё не реализован в orca.py.
-            if not stale_alert_sent:
+            # Только наблюдение: ребаланс должен сделать человек. Раньше алерт был
+            # ОДНОРАЗОВЫМ (stale_alert_sent) — то есть ровно тот же молчаливый
+            # сценарий, что случился в ночь на 2026-07-28: одно сообщение, и потом
+            # тишина часами, пока владелец сам не откроет /status. Напоминаем с той
+            # же периодичностью, что и о заблокированном ребалансе.
+            if _should_send_blocked_reminder(now):
                 await tg.notify_manual_action_needed(position)
                 log.warning("Цена вне диапазона дольше %d мин — нужен ручной ребаланс (AUTO_REBALANCE=false)", REBALANCE_DELAY_MIN)
                 stale_alert_sent = True
+                rebalance_blocked_alert_sent = True
+                rebalance_blocked_last_alert_at = now
             _reset_rpc_error_state()
             return
 
@@ -202,15 +243,24 @@ async def monitor_position() -> None:
             tg.current_position = position
             log.info("Цена вернулась в диапазон, ребаланс отменён")
             await tg.notify_price_returned(position)
+            _reset_rebalance_blocked_state()
             _reset_rpc_error_state()
             return
 
         # Низкий SOL блокирует только реальное действие, не мониторинг.
         # out_of_range_since не трогаем — на следующем тике попробуем снова.
         if sol_balance is not None and sol_balance < MIN_SOL_BALANCE:
-            if not low_sol_alert_sent:
-                await tg.notify_low_sol_balance(sol_balance)
-                low_sol_alert_sent = True
+            if _should_send_blocked_reminder(now):
+                await tg.notify_rebalance_blocked_low_sol(
+                    sol_balance=sol_balance,
+                    min_sol_balance=MIN_SOL_BALANCE,
+                    current_price=current_price,
+                    lower_price=position.lower_price,
+                    upper_price=position.upper_price,
+                    minutes_out=minutes_out,
+                )
+                rebalance_blocked_alert_sent = True
+                rebalance_blocked_last_alert_at = now
             log.warning(f"Низкий баланс SOL: {sol_balance:.4f} — ребаланс отложен")
             _reset_rpc_error_state()
             return
@@ -244,6 +294,7 @@ async def monitor_position() -> None:
                     tg.current_position = new_position
                     await tg.notify_rebalance_complete(fresh_position, new_position)
                     log.info(f"Ребаланс завершён. Новый диапазон: ${new_position.lower_price:.2f}—${new_position.upper_price:.2f}")
+                    _reset_rebalance_blocked_state()
                 else:
                     await tg.notify_rebalance_error("Не удалось выполнить ребаланс")
                     log.error("Ребаланс не удался")

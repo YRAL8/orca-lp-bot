@@ -190,6 +190,44 @@ async def notify_low_sol_balance(balance: float) -> None:
     )
 
 
+def _format_out_of_range_duration(minutes_out: float) -> str:
+    """Человекочитаемая длительность, чтобы подсветить серьёзность инцидента."""
+    if minutes_out <= 0:
+        return "0 мин"
+    total_minutes = int(round(minutes_out))
+    hours = total_minutes // 60
+    minutes = total_minutes % 60
+    if hours <= 0:
+        return f"{total_minutes} мин"
+    if minutes == 0:
+        return f"{hours}ч"
+    return f"{hours}ч {minutes}мин"
+
+
+async def notify_rebalance_blocked_low_sol(
+    *,
+    sol_balance: float,
+    min_sol_balance: float,
+    current_price: float,
+    lower_price: float,
+    upper_price: float,
+    minutes_out: float,
+) -> None:
+    """
+    Критический алерт: позиция вне диапазона и авто-ребаланс заблокирован из-за SOL.
+    Не путать с обычным notify_low_sol_balance — это разные по важности события.
+    """
+    duration = _format_out_of_range_duration(minutes_out)
+    await send_message(
+        f"🛑 <b>Ребаланс заблокирован — мало SOL</b>\n"
+        f"Позиция вне диапазона уже: {duration}\n"
+        f"Баланс SOL: {sol_balance:.4f} (нужно ≥ {min_sol_balance:.4f})\n"
+        f"Текущая цена: ${current_price:.2f}\n"
+        f"Диапазон: ${lower_price:.2f} — ${upper_price:.2f}\n"
+        f"Пополни кошелёк — иначе ребаланс невозможен."
+    )
+
+
 async def notify_rpc_down(ticks: int) -> None:
     """Уведомление о недоступности RPC после серии подряд ошибок."""
     await send_message(
